@@ -10,7 +10,7 @@ import torch
 @dataclass
 class QuantResult:
     tensor: torch.Tensor
-    inv_scale: torch.Tensor
+    dequant_scale: torch.Tensor
     impl: str
     meta: dict[str, Any] = field(default_factory=dict)
 

@@ -5,12 +5,13 @@ import triton.language as tl
 
 
 @triton.jit
-def batch_fp8_per_tensor_bmm_kernel(
+def batch_fp8_per_channel_bmm_kernel(
     a_ptr,
     b_ptr,
     c_ptr,
     bias_ptr,
-    scale_ptr,
+    dequant_scale_a_ptr,
+    dequant_scale_b_ptr,
     m,
     n,
     k,
@@ -26,6 +27,10 @@ def batch_fp8_per_tensor_bmm_kernel(
     stride_biasb,
     stride_biasm,
     stride_biasn,
+    stride_scale_ab,
+    stride_scale_ax,
+    stride_scale_bb,
+    stride_scale_bx,
     USE_BIAS: tl.constexpr,
     B_N_ORDER: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -69,7 +74,21 @@ def batch_fp8_per_tensor_bmm_kernel(
         a_block = tl.advance(a_block, (0, BLOCK_K))
         b_block = tl.advance(b_block, (BLOCK_K, 0))
 
-    accumulator *= tl.load(scale_ptr)
+    off_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    off_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    dequant_scale_a = tl.load(
+        dequant_scale_a_ptr + batch * stride_scale_ab + off_m * stride_scale_ax,
+        mask=off_m < m,
+        padding_option="zero",
+    ).to(tl.float32)
+    dequant_scale_b = tl.load(
+        dequant_scale_b_ptr + batch * stride_scale_bb + off_n * stride_scale_bx,
+        mask=off_n < n,
+        other=0.0
+    ).to(tl.float32)
+    dequant_scale = dequant_scale_a[:, None] * dequant_scale_b[None, :]
+
+    accumulator *= dequant_scale
     if USE_BIAS:
         bias_block = tl.make_block_ptr(
             base=bias_ptr + batch * stride_biasb,
@@ -129,7 +148,7 @@ _CONFIGS = [
     ),
 ]
 
-batch_fp8_per_tensor_bmm_kernel_autotuned = triton.autotune(
+batch_fp8_per_channel_bmm_kernel_autotuned = triton.autotune(
     configs=_CONFIGS,
     key=["m", "n", "k", "B_N_ORDER", "USE_BIAS"],
-)(batch_fp8_per_tensor_bmm_kernel)
+)(batch_fp8_per_channel_bmm_kernel)

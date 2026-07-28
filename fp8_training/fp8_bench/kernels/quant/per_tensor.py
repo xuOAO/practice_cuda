@@ -5,7 +5,7 @@ import triton.language as tl
 
 
 @triton.jit
-def fp8_quant_kernel(
+def fp8_per_tensor_quant_kernel(
     x_ptr,
     y_ptr,
     m,
@@ -50,7 +50,7 @@ _CONFIGS = [
     triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=8, num_stages=3),
 ]
 
-fp8_quant_kernel_autotuned = triton.autotune(
+fp8_per_tensor_quant_kernel_autotuned = triton.autotune(
     configs=_CONFIGS,
     key=["m", "n"],
-)(fp8_quant_kernel)
+)(fp8_per_tensor_quant_kernel)

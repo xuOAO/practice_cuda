@@ -6,27 +6,18 @@ import torch
 import triton
 
 from fp8_bench.kernels.bmm.per_tensor import (
-    batch_fp8_bmm_kernel,
-    batch_fp8_bmm_kernel_autotuned,
+    batch_fp8_per_tensor_bmm_kernel,
+    batch_fp8_per_tensor_bmm_kernel_autotuned,
 )
 from fp8_bench.kernels.quant.per_tensor import (
-    fp8_quant_kernel,
-    fp8_quant_kernel_autotuned,
+    fp8_per_tensor_quant_kernel,
+    fp8_per_tensor_quant_kernel_autotuned,
 )
 from fp8_bench.registry import (
     QuantResult,
     register_bmm,
     register_quant,
 )
-
-
-def _fp8_max(dtype: torch.dtype) -> float:
-    if dtype == torch.float8_e4m3fn:
-        return 448.0
-    if dtype == torch.float8_e5m2:
-        return 57344.0
-    raise ValueError(f"expected an FP8 dtype, got {dtype}")
-
 
 def triton_per_tensor_quant(
     x: torch.Tensor,
@@ -35,30 +26,24 @@ def triton_per_tensor_quant(
     eps: float = 1e-12,
     profile: bool = False,
 ) -> QuantResult:
-    if x.ndim not in {2, 3}:
-        raise ValueError(f"quant input must be 2D or 3D, got shape={tuple(x.shape)}")
+    assert x.ndim == 3, "BMM expects 3D quantized tensors"
 
     x_min, x_max = x.aminmax()
     max_abs = torch.maximum(x_min.abs(), x_max.abs()).clamp(min=eps)
-    fp8_max = _fp8_max(fp8_dtype)
+    fp8_max = torch.finfo(fp8_dtype).max
     quant_scale = fp8_max / max_abs
     inv_scale = quant_scale.reciprocal()
     output = torch.empty_like(x, dtype=fp8_dtype)
 
-    if x.ndim == 2:
-        m, n = x.shape
-        batch = 1
-        stride_xb = stride_yb = 0
-    else:
-        batch, m, n = x.shape
-        stride_xb = x.stride(0)
-        stride_yb = output.stride(0)
+    batch, m, n = x.shape
+    stride_xb = x.stride(0)
+    stride_yb = output.stride(0)
 
     grid = lambda meta: (
         triton.cdiv(m, meta["BLOCK_M"]) * triton.cdiv(n, meta["BLOCK_N"]),
         batch,
     )
-    kernel = fp8_quant_kernel if profile else fp8_quant_kernel_autotuned
+    kernel = fp8_per_tensor_quant_kernel if profile else fp8_per_tensor_quant_kernel_autotuned
     launch_kwargs = {}
     if profile:
         launch_kwargs = {
@@ -110,24 +95,25 @@ def logical_b_tensor(value: QuantResult, layout: str) -> torch.Tensor:
     return value.tensor.transpose(1, 2)
 
 
-def _triton_bmm(
+def triton_per_tensor_bmm(
     a: QuantResult,
     b: QuantResult,
     *,
-    layout: str,
     out_dtype: torch.dtype = torch.bfloat16,
     bias: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
-    quant_scale: Optional[torch.Tensor] = None,
+    do_transpose_b: bool = False,
     profile: bool = False,
 ) -> torch.Tensor:
     if a.tensor.ndim != 3 or b.tensor.ndim != 3:
         raise ValueError("BMM expects 3D quantized tensors")
     batch, m, k = a.tensor.shape
-    if layout == "n":
-        b_batch, b_k, n = b.tensor.shape
-    else:
-        b_batch, n, b_k = b.tensor.shape
+
+    layout = "n-major" if b.tensor.stride(1) > b.tensor.stride(2) else "k-major"
+    assert not do_transpose_b or layout == "n-major", "do_transpose_b is only supported for layout 'n-major'"
+
+    b_batch, b_k, n = b.tensor.shape
+
     if batch != b_batch or k != b_k:
         raise ValueError(f"shape mismatch: A={a.tensor.shape}, B={b.tensor.shape}")
 
@@ -140,21 +126,16 @@ def _triton_bmm(
         bias_ptr = bias
         stride_biasb, stride_biasm, stride_biasn = bias.stride()
 
-    if layout == "n":
-        stride_bb, stride_bk, stride_bn = b.tensor.stride()
-    else:
-        stride_bb = b.tensor.stride(0)
-        stride_bk = b.tensor.stride(2)
-        stride_bn = b.tensor.stride(1)
+    if do_transpose_b:
+        b.tensor = b.tensor.transpose(1, 2).contiguous().transpose(1, 2)
 
-    combined_inv_scale = (
-        quant_scale if quant_scale is not None else a.inv_scale * b.inv_scale
-    )
+    dequant_scale = a.dequant_scale * b.dequant_scale
+
     grid = lambda meta: (
         triton.cdiv(m, meta["BLOCK_M"]) * triton.cdiv(n, meta["BLOCK_N"]),
         batch,
     )
-    kernel = batch_fp8_bmm_kernel if profile else batch_fp8_bmm_kernel_autotuned
+    kernel = batch_fp8_per_tensor_bmm_kernel if profile else batch_fp8_per_tensor_bmm_kernel_autotuned
     launch_kwargs = {}
     if profile:
         launch_kwargs = {
@@ -170,14 +151,12 @@ def _triton_bmm(
         b.tensor,
         out,
         bias_ptr,
-        combined_inv_scale,
+        dequant_scale,
         m,
         n,
         k,
         *a.tensor.stride(),
-        stride_bb,
-        stride_bk,
-        stride_bn,
+        *b.tensor.stride(),
         *out.stride(),
         stride_biasb,
         stride_biasm,
@@ -188,15 +167,6 @@ def _triton_bmm(
     )
     return out
 
-
-def triton_per_tensor_bmm_n(*args, **kwargs) -> torch.Tensor:
-    return _triton_bmm(*args, layout="n", **kwargs)
-
-
-def triton_per_tensor_bmm_k(*args, **kwargs) -> torch.Tensor:
-    return _triton_bmm(*args, layout="k", **kwargs)
-
-
 register_quant(
     "triton_per_tensor",
     triton_per_tensor_quant,
@@ -204,7 +174,7 @@ register_quant(
 )
 register_bmm(
     "triton_per_tensor_n",
-    triton_per_tensor_bmm_n,
+    triton_per_tensor_bmm,
     quant_impl="triton_per_tensor",
     layout="n",
     prepare_b=lambda value: prepare_b_layout(value, "n"),
@@ -213,7 +183,7 @@ register_bmm(
 )
 register_bmm(
     "triton_per_tensor_k",
-    triton_per_tensor_bmm_k,
+    triton_per_tensor_bmm,
     quant_impl="triton_per_tensor",
     layout="k",
     prepare_b=lambda value: prepare_b_layout(value, "k"),
