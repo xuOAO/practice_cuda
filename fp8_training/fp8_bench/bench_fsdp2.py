@@ -20,11 +20,14 @@ def fake_quant_ste(x: torch.Tensor, fp8_dtype: torch.dtype) -> torch.Tensor:
     straight-through estimator. The matmul itself is BF16, so this provider is
     an infrastructure case rather than an FP8 tensor-core performance result.
     """
-    fp8_max = 448.0 if fp8_dtype == torch.float8_e4m3fn else 57344.0
+    fp8_max = torch.finfo(fp8_dtype).max
     with torch.no_grad():
         max_abs = x.detach().abs().amax().clamp(min=1e-12)
-        inv_scale = max_abs / fp8_max
-        dequant = (x.detach() / inv_scale).to(fp8_dtype).to(x.dtype) * inv_scale
+        dequant_scale = max_abs / fp8_max
+        dequant = (
+            (x.detach() / dequant_scale).to(fp8_dtype).to(x.dtype)
+            * dequant_scale
+        )
     return x + (dequant - x).detach()
 
 

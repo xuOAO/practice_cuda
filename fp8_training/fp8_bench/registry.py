@@ -15,7 +15,7 @@ class QuantResult:
     meta: dict[str, Any] = field(default_factory=dict)
 
     def dequantize(self, dtype: torch.dtype = torch.float32) -> torch.Tensor:
-        return self.tensor.to(dtype) * self.inv_scale.to(dtype)
+        return self.tensor.to(dtype) * self.dequant_scale.to(dtype)
 
 
 @dataclass(frozen=True)
@@ -32,7 +32,6 @@ class BMMImpl:
     quant_impl: str
     layout: str
     prepare_b: Callable[[QuantResult], QuantResult]
-    logical_b: Callable[[QuantResult], torch.Tensor]
     description: str = ""
 
 
@@ -54,7 +53,6 @@ def register_bmm(
     quant_impl: str,
     layout: str,
     prepare_b: Callable[[QuantResult], QuantResult],
-    logical_b: Callable[[QuantResult], torch.Tensor],
     description: str = "",
 ) -> None:
     if name in BMM_IMPLS:
@@ -67,7 +65,6 @@ def register_bmm(
         quant_impl,
         layout,
         prepare_b,
-        logical_b,
         description,
     )
 

@@ -131,5 +131,5 @@ _CONFIGS = [
 
 batch_fp8_per_tensor_bmm_kernel_autotuned = triton.autotune(
     configs=_CONFIGS,
-    key=["m", "n", "k", "B_N_ORDER", "USE_BIAS"],
+    key=["m", "n", "k", "B_N_MAJOR", "USE_BIAS"],
 )(batch_fp8_per_tensor_bmm_kernel)

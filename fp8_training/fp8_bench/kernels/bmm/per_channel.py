@@ -32,7 +32,7 @@ def batch_fp8_per_channel_bmm_kernel(
     stride_scale_bb,
     stride_scale_bx,
     USE_BIAS: tl.constexpr,
-    B_N_ORDER: tl.constexpr,
+    B_N_MAJOR: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -63,7 +63,7 @@ def batch_fp8_per_channel_bmm_kernel(
         strides=(stride_bk, stride_bn),
         offsets=(0, pid_n * BLOCK_N),
         block_shape=(BLOCK_K, BLOCK_N),
-        order=(1, 0) if B_N_ORDER else (0, 1),
+        order=(1, 0) if B_N_MAJOR else (0, 1),
     )
 
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
@@ -150,5 +150,5 @@ _CONFIGS = [
 
 batch_fp8_per_channel_bmm_kernel_autotuned = triton.autotune(
     configs=_CONFIGS,
-    key=["m", "n", "k", "B_N_ORDER", "USE_BIAS"],
+    key=["m", "n", "k", "B_N_MAJOR", "USE_BIAS"],
 )(batch_fp8_per_channel_bmm_kernel)

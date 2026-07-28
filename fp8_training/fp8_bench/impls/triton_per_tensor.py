@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import partial
 from typing import Optional
 
 import torch
@@ -19,6 +20,7 @@ from fp8_bench.registry import (
     register_quant,
 )
 
+
 def triton_per_tensor_quant(
     x: torch.Tensor,
     *,
@@ -26,18 +28,26 @@ def triton_per_tensor_quant(
     eps: float = 1e-12,
     profile: bool = False,
 ) -> QuantResult:
-    assert x.ndim == 3, "BMM expects 3D quantized tensors"
+    if x.ndim not in {2, 3}:
+        raise ValueError(
+            f"per-tensor quant expects a 2D or 3D tensor, got shape={tuple(x.shape)}"
+        )
 
     x_min, x_max = x.aminmax()
-    max_abs = torch.maximum(x_min.abs(), x_max.abs()).clamp(min=eps)
+    max_abs = torch.maximum(x_min.abs(), x_max.abs()).float().clamp(min=eps)
     fp8_max = torch.finfo(fp8_dtype).max
     quant_scale = fp8_max / max_abs
-    inv_scale = quant_scale.reciprocal()
+    dequant_scale = quant_scale.reciprocal()
     output = torch.empty_like(x, dtype=fp8_dtype)
 
-    batch, m, n = x.shape
-    stride_xb = x.stride(0)
-    stride_yb = output.stride(0)
+    if x.ndim == 2:
+        batch = 1
+        m, n = x.shape
+        stride_xb = stride_yb = 0
+    else:
+        batch, m, n = x.shape
+        stride_xb = x.stride(0)
+        stride_yb = output.stride(0)
 
     grid = lambda meta: (
         triton.cdiv(m, meta["BLOCK_M"]) * triton.cdiv(n, meta["BLOCK_N"]),
@@ -70,7 +80,7 @@ def triton_per_tensor_quant(
     )
     return QuantResult(
         tensor=output,
-        inv_scale=inv_scale,
+        dequant_scale=dequant_scale,
         impl="triton_per_tensor",
         meta={"logical_shape": tuple(x.shape), "fp8_dtype": str(fp8_dtype)},
     )
@@ -82,17 +92,22 @@ def prepare_b_layout(value: QuantResult, layout: str) -> QuantResult:
     if layout != "k":
         raise ValueError(f"unknown B layout: {layout}")
     return QuantResult(
-        tensor=value.tensor.transpose(1, 2).contiguous(),
-        inv_scale=value.inv_scale,
+        tensor=value.tensor.transpose(-1, -2).contiguous().transpose(-1, -2),
+        dequant_scale=value.dequant_scale,
         impl=value.impl,
         meta={**value.meta, "layout": "k"},
     )
 
 
-def logical_b_tensor(value: QuantResult, layout: str) -> torch.Tensor:
-    if layout == "n":
-        return value.tensor
-    return value.tensor.transpose(1, 2)
+def _b_layout(tensor: torch.Tensor) -> str:
+    if tensor.stride(-1) == 1:
+        return "n-major"
+    if tensor.stride(-2) == 1:
+        return "k-major"
+    raise ValueError(
+        "B must be contiguous along either N or K; "
+        f"shape={tuple(tensor.shape)}, strides={tensor.stride()}"
+    )
 
 
 def triton_per_tensor_bmm(
@@ -103,40 +118,105 @@ def triton_per_tensor_bmm(
     bias: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     do_transpose_b: bool = False,
+    dequant_scale: Optional[torch.Tensor] = None,
     profile: bool = False,
 ) -> torch.Tensor:
     if a.tensor.ndim != 3 or b.tensor.ndim != 3:
         raise ValueError("BMM expects 3D quantized tensors")
-    batch, m, k = a.tensor.shape
-
-    layout = "n-major" if b.tensor.stride(-1) == 1 else "k-major"
-    assert not do_transpose_b or layout == "n-major", "do_transpose_b is only supported for layout 'n-major'"
-    B_N_MAJOR = not do_transpose_b and layout == "n-major"
 
     a_tensor = a.tensor
-    b_tensor = b.tensor.transpose(1, 2).contiguous().transpose(1, 2) if do_transpose_b else b.tensor
+    if a_tensor.stride(-1) != 1:
+        raise ValueError(
+            "A must be contiguous along K; "
+            f"shape={tuple(a_tensor.shape)}, strides={a_tensor.stride()}"
+        )
 
+    input_b_layout = _b_layout(b.tensor)
+    if do_transpose_b:
+        if input_b_layout != "n-major":
+            raise ValueError(
+                "do_transpose_b=True requires an N-major B input; "
+                f"strides={b.tensor.stride()}"
+            )
+        b_tensor = b.tensor.transpose(-1, -2).contiguous().transpose(-1, -2)
+    else:
+        b_tensor = b.tensor
+    b_n_major = _b_layout(b_tensor) == "n-major"
+
+    batch, m, k = a_tensor.shape
     b_batch, b_k, n = b_tensor.shape
 
     if batch != b_batch or k != b_k:
-        raise ValueError(f"shape mismatch: A={a.tensor.shape}, B={b.tensor.shape}")
+        raise ValueError(
+            f"shape mismatch: A={tuple(a_tensor.shape)}, B={tuple(b_tensor.shape)}"
+        )
+    if a_tensor.device != b_tensor.device:
+        raise ValueError(
+            f"A and B must be on the same device: A={a_tensor.device}, B={b_tensor.device}"
+        )
+    if a_tensor.dtype != b_tensor.dtype:
+        raise ValueError(
+            f"A and B must have the same FP8 dtype: A={a_tensor.dtype}, B={b_tensor.dtype}"
+        )
 
     if out is None:
         out = torch.empty((batch, m, n), device=a_tensor.device, dtype=out_dtype)
+    elif out.shape != (batch, m, n):
+        raise ValueError(
+            f"out must have shape {(batch, m, n)}, got {tuple(out.shape)}"
+        )
+    elif out.device != a_tensor.device:
+        raise ValueError(
+            f"out must be on {a_tensor.device}, got {out.device}"
+        )
+    elif out.dtype != out_dtype:
+        raise ValueError(f"out must have dtype {out_dtype}, got {out.dtype}")
+    elif out.stride(-1) != 1:
+        raise ValueError(
+            "out must be contiguous along N; "
+            f"shape={tuple(out.shape)}, strides={out.stride()}"
+        )
     if bias is None:
         bias_ptr = a_tensor
         stride_biasb = stride_biasm = stride_biasn = 0
     else:
+        if bias.shape != (batch, m, n):
+            raise ValueError(
+                f"bias must have shape {(batch, m, n)}, got {tuple(bias.shape)}"
+            )
+        if bias.device != a_tensor.device:
+            raise ValueError(
+                f"bias must be on {a_tensor.device}, got {bias.device}"
+            )
         bias_ptr = bias
         stride_biasb, stride_biasm, stride_biasn = bias.stride()
 
-    dequant_scale = a.dequant_scale * b.dequant_scale
+    if dequant_scale is None:
+        dequant_scale = a.dequant_scale * b.dequant_scale
+    if dequant_scale.numel() != 1:
+        raise ValueError(
+            "per-tensor BMM expects one combined dequant scale, "
+            f"got shape={tuple(dequant_scale.shape)}"
+        )
+    if dequant_scale.dtype != torch.float32:
+        raise ValueError(
+            f"dequant_scale must be float32, got {dequant_scale.dtype}"
+        )
+    if dequant_scale.device != a_tensor.device:
+        raise ValueError(
+            "dequant_scale must be on the same device as A and B: "
+            f"scale={dequant_scale.device}, tensors={a_tensor.device}"
+        )
 
     grid = lambda meta: (
         triton.cdiv(m, meta["BLOCK_M"]) * triton.cdiv(n, meta["BLOCK_N"]),
         batch,
     )
-    kernel = batch_fp8_per_tensor_bmm_kernel if profile else batch_fp8_per_tensor_bmm_kernel_autotuned
+    kernel = (
+        batch_fp8_per_tensor_bmm_kernel
+        if profile
+        else batch_fp8_per_tensor_bmm_kernel_autotuned
+    )
     launch_kwargs = {}
     if profile:
         launch_kwargs = {
@@ -163,7 +243,7 @@ def triton_per_tensor_bmm(
         stride_biasm,
         stride_biasn,
         USE_BIAS=bias is not None,
-        B_N_MAJOR=B_N_MAJOR,
+        B_N_MAJOR=b_n_major,
         **launch_kwargs,
     )
     return out
@@ -175,19 +255,25 @@ register_quant(
 )
 register_bmm(
     "triton_per_tensor_n",
-    triton_per_tensor_bmm,
+    partial(triton_per_tensor_bmm, do_transpose_b=False),
     quant_impl="triton_per_tensor",
     layout="n",
     prepare_b=lambda value: prepare_b_layout(value, "n"),
-    logical_b=lambda value: logical_b_tensor(value, "n"),
     description="Migrated FP8 BMM with contiguous [B,K,N] right operand.",
 )
 register_bmm(
     "triton_per_tensor_k",
-    triton_per_tensor_bmm,
+    partial(triton_per_tensor_bmm, do_transpose_b=False),
     quant_impl="triton_per_tensor",
     layout="k",
     prepare_b=lambda value: prepare_b_layout(value, "k"),
-    logical_b=lambda value: logical_b_tensor(value, "k"),
-    description="Migrated FP8 BMM with contiguous [B,N,K] right operand.",
+    description="FP8 BMM with a prepacked K-major [B,K,N] right operand.",
+)
+register_bmm(
+    "triton_per_tensor_n_transpose",
+    partial(triton_per_tensor_bmm, do_transpose_b=True),
+    quant_impl="triton_per_tensor",
+    layout="n",
+    prepare_b=lambda value: prepare_b_layout(value, "n"),
+    description="N-major FP8 BMM with explicit N-to-K packing inside the call.",
 )

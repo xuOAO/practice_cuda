@@ -74,7 +74,7 @@ def main() -> None:
             quant_impl = get_quant(bmm_impl.quant_impl)
             qa = quant_impl.fn(a, fp8_dtype=fp8_dtype)
             qb = bmm_impl.prepare_b(quant_impl.fn(b, fp8_dtype=fp8_dtype))
-            combined_inv_scale = qa.inv_scale * qb.inv_scale
+            combined_dequant_scale = qa.dequant_scale * qb.dequant_scale
             out = torch.empty((batch, m, n), device="cuda", dtype=out_dtype)
 
             values = {
@@ -100,7 +100,7 @@ def main() -> None:
                         out_dtype=out_dtype,
                         bias=bias,
                         out=out,
-                        quant_scale=combined_inv_scale,
+                        dequant_scale=combined_dequant_scale,
                     ),
                     warmup=args.warmup,
                     iters=args.iters,
@@ -152,11 +152,10 @@ def main() -> None:
                     out_dtype=out_dtype,
                     bias=bias,
                     out=out,
-                    quant_scale=combined_inv_scale,
+                    dequant_scale=combined_dequant_scale,
                 )
                 dequant_a = qa.dequantize()
-                logical_qb = bmm_impl.logical_b(qb).float() * qb.inv_scale.float()
-                kernel_reference = torch.bmm(dequant_a, logical_qb)
+                kernel_reference = torch.bmm(dequant_a, qb.dequantize())
                 pipeline_reference = torch.bmm(a.float(), b.float())
                 if bias is not None:
                     kernel_reference += bias.float()

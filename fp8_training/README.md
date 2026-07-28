@@ -3,7 +3,8 @@
 一个偏实验性质的 FP8 bench。当前内置了从旧实验迁过来的一组实现：
 
 - per-tensor scaling Triton quant，支持 E4M3 / E5M2；
-- FP8 BMM，支持右矩阵 `[B,K,N]` 连续和 `[B,N,K]` 连续两种布局；
+- FP8 BMM，右矩阵逻辑 shape 固定为 `[B,K,N]`，支持 N-major、
+  预先 K-major 和 N-major 显式重排三条路径；
 - 旧 benchmark 的 quant/BMM shapes；
 - FSDP2 BF16 baseline 和一个用于验证训练链路的 fake-FP8 case。
 
@@ -61,6 +62,7 @@ python3 -m fp8_bench.bench_bmm \
   --suite smoke \
   --impl triton_per_tensor_n \
   --impl triton_per_tensor_k \
+  --impl triton_per_tensor_n_transpose \
   --mode both
 ```
 
@@ -71,6 +73,7 @@ python3 -m fp8_bench.bench_bmm \
   --suite legacy \
   --impl triton_per_tensor_n \
   --impl triton_per_tensor_k \
+  --impl triton_per_tensor_n_transpose \
   --mode perf \
   --warmup 20 --iters 100 --repeats 5
 ```
@@ -88,9 +91,22 @@ python3 -m fp8_bench.bench_bmm \
   --bias
 ```
 
-`bmm-only` 的计时不包含 quant；`pipeline` 包含 A/B quant、K-order 所需的
-layout 转换和 BMM。精度输出中，`kernel_rel_l2` 对比相同 FP8 输入的 FP32
-累加 reference，`pipeline_rel_l2` 对比原始输入的 FP32 BMM。
+三个实现共用同一个 `triton_per_tensor_bmm` 和 Triton kernel：
+
+```text
+triton_per_tensor_n             N-major B，直接进入 Triton BMM
+triton_per_tensor_k             BMM 计时前预先准备成 K-major
+triton_per_tensor_n_transpose   N-major B，在 BMM wrapper 内显式重排成 K-major
+```
+
+三者的 B 逻辑 shape 始终是 `[B,K,N]`，N-major/K-major 只由 stride 区分。
+`triton_per_tensor_n_transpose` 的 `bmm-only` 包含显式 N→K 重排，另外两种
+`bmm-only` 不包含 quant 或 layout 准备；per-tensor dequant scale 会在
+计时前合并。`pipeline` 则包含 A/B quant、必要的 layout 转换、scale 合并
+和 BMM。
+
+精度输出中，`kernel_rel_l2` 对比相同 FP8 输入的 FP32 累加 reference，
+`pipeline_rel_l2` 对比原始输入的 FP32 BMM。
 
 BMM 使用 `2 * B * M * N * K` 计算 FLOPs，终端和 JSONL 都会输出：
 
@@ -133,7 +149,7 @@ BMM：
 mkdir -p reports
 ncu \
   --set full \
-  --kernel-name 'regex:.*batch_fp8_bmm_kernel.*' \
+  --kernel-name 'regex:.*batch_fp8_per_tensor_bmm_kernel.*' \
   --launch-skip 5 \
   --launch-count 1 \
   -o reports/bmm_b16_m512_n960_k1280 \
@@ -143,6 +159,11 @@ ncu \
     --impl triton_per_tensor_n \
     --warmup 5
 ```
+
+把 `--impl` 换成 `triton_per_tensor_k` 或
+`triton_per_tensor_n_transpose` 即可 profile 另外两条路径。这里的
+kernel-name 过滤器只采集最终 BMM kernel；显式重排的端到端成本以
+`bench_bmm` 的 `bmm-only` 时间为准。
 
 如果只想快速看报告，把 `--set full` 改为 `--set basic`。
 

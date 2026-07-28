@@ -91,11 +91,11 @@ def main() -> None:
                 result = impl.fn(x, fp8_dtype=fp8_dtype)
                 dequant = result.dequantize()
                 metrics = accuracy_metrics(dequant, x)
-                fp8_max = 448.0 if fp8_dtype == torch.float8_e4m3fn else 57344.0
+                fp8_max = torch.finfo(fp8_dtype).max
                 metrics["saturation_ratio"] = float(
                     (result.tensor.float().abs() == fp8_max).float().mean().item()
                 )
-                metrics["inv_scale"] = float(result.inv_scale.item())
+                metrics["dequant_scale"] = float(result.dequant_scale.item())
                 values["accuracy"] = metrics
                 print(
                     f"accuracy {case.name} [{impl_name}]"
