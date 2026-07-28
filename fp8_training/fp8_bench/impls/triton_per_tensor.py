@@ -109,25 +109,26 @@ def triton_per_tensor_bmm(
         raise ValueError("BMM expects 3D quantized tensors")
     batch, m, k = a.tensor.shape
 
-    layout = "n-major" if b.tensor.stride(1) > b.tensor.stride(2) else "k-major"
+    layout = "n-major" if b.tensor.stride(-1) == 1 else "k-major"
     assert not do_transpose_b or layout == "n-major", "do_transpose_b is only supported for layout 'n-major'"
+    B_N_MAJOR = not do_transpose_b and layout == "n-major"
 
-    b_batch, b_k, n = b.tensor.shape
+    a_tensor = a.tensor
+    b_tensor = b.tensor.transpose(1, 2).contiguous().transpose(1, 2) if do_transpose_b else b.tensor
+
+    b_batch, b_k, n = b_tensor.shape
 
     if batch != b_batch or k != b_k:
         raise ValueError(f"shape mismatch: A={a.tensor.shape}, B={b.tensor.shape}")
 
     if out is None:
-        out = torch.empty((batch, m, n), device=a.tensor.device, dtype=out_dtype)
+        out = torch.empty((batch, m, n), device=a_tensor.device, dtype=out_dtype)
     if bias is None:
-        bias_ptr = a.tensor
+        bias_ptr = a_tensor
         stride_biasb = stride_biasm = stride_biasn = 0
     else:
         bias_ptr = bias
         stride_biasb, stride_biasm, stride_biasn = bias.stride()
-
-    if do_transpose_b:
-        b.tensor = b.tensor.transpose(1, 2).contiguous().transpose(1, 2)
 
     dequant_scale = a.dequant_scale * b.dequant_scale
 
@@ -147,22 +148,22 @@ def triton_per_tensor_bmm(
             "num_stages": 3,
         }
     kernel[grid](
-        a.tensor,
-        b.tensor,
+        a_tensor,
+        b_tensor,
         out,
         bias_ptr,
         dequant_scale,
         m,
         n,
         k,
-        *a.tensor.stride(),
-        *b.tensor.stride(),
+        *a_tensor.stride(),
+        *b_tensor.stride(),
         *out.stride(),
         stride_biasb,
         stride_biasm,
         stride_biasn,
         USE_BIAS=bias is not None,
-        B_N_ORDER=layout == "n",
+        B_N_MAJOR=B_N_MAJOR,
         **launch_kwargs,
     )
     return out
