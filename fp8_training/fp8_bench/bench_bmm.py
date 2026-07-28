@@ -72,9 +72,19 @@ def main() -> None:
         for impl_name in impl_names:
             bmm_impl = get_bmm(impl_name)
             quant_impl = get_quant(bmm_impl.quant_impl)
-            qa = quant_impl.fn(a, fp8_dtype=fp8_dtype)
-            qb = bmm_impl.prepare_b(quant_impl.fn(b, fp8_dtype=fp8_dtype))
-            combined_dequant_scale = qa.dequant_scale * qb.dequant_scale
+            qa = quant_impl.fn(
+                a,
+                fp8_dtype=fp8_dtype,
+                **bmm_impl.quant_a_kwargs,
+            )
+            qb = bmm_impl.prepare_b(
+                quant_impl.fn(
+                    b,
+                    fp8_dtype=fp8_dtype,
+                    **bmm_impl.quant_b_kwargs,
+                )
+            )
+            call_kwargs = bmm_impl.prepare_call_kwargs(qa, qb)
             out = torch.empty((batch, m, n), device="cuda", dtype=out_dtype)
 
             values = {
@@ -83,6 +93,8 @@ def main() -> None:
                 "shape": case.shape,
                 "impl": impl_name,
                 "quant_impl": bmm_impl.quant_impl,
+                "quant_a_kwargs": bmm_impl.quant_a_kwargs,
+                "quant_b_kwargs": bmm_impl.quant_b_kwargs,
                 "layout": bmm_impl.layout,
                 "input_dtype": str(input_dtype),
                 "out_dtype": str(out_dtype),
@@ -100,7 +112,7 @@ def main() -> None:
                         out_dtype=out_dtype,
                         bias=bias,
                         out=out,
-                        dequant_scale=combined_dequant_scale,
+                        **call_kwargs,
                     ),
                     warmup=args.warmup,
                     iters=args.iters,
@@ -109,9 +121,17 @@ def main() -> None:
                 kernel_perf["tflops"] = flops / kernel_perf["median_ms"] / 1e9
 
                 def run_pipeline() -> torch.Tensor:
-                    run_qa = quant_impl.fn(a, fp8_dtype=fp8_dtype)
+                    run_qa = quant_impl.fn(
+                        a,
+                        fp8_dtype=fp8_dtype,
+                        **bmm_impl.quant_a_kwargs,
+                    )
                     run_qb = bmm_impl.prepare_b(
-                        quant_impl.fn(b, fp8_dtype=fp8_dtype)
+                        quant_impl.fn(
+                            b,
+                            fp8_dtype=fp8_dtype,
+                            **bmm_impl.quant_b_kwargs,
+                        )
                     )
                     return bmm_impl.fn(
                         run_qa,
@@ -152,7 +172,7 @@ def main() -> None:
                     out_dtype=out_dtype,
                     bias=bias,
                     out=out,
-                    dequant_scale=combined_dequant_scale,
+                    **call_kwargs,
                 )
                 dequant_a = qa.dequantize()
                 kernel_reference = torch.bmm(dequant_a, qb.dequantize())

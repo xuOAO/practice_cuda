@@ -95,7 +95,13 @@ def main() -> None:
                 metrics["saturation_ratio"] = float(
                     (result.tensor.float().abs() == fp8_max).float().mean().item()
                 )
-                metrics["dequant_scale"] = float(result.dequant_scale.item())
+                scale = result.dequant_scale.float()
+                if scale.numel() == 1:
+                    metrics["dequant_scale"] = float(scale.item())
+                else:
+                    metrics["dequant_scale_min"] = float(scale.min().item())
+                    metrics["dequant_scale_max"] = float(scale.max().item())
+                    metrics["dequant_scale_mean"] = float(scale.mean().item())
                 values["accuracy"] = metrics
                 print(
                     f"accuracy {case.name} [{impl_name}]"

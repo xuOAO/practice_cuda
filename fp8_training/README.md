@@ -3,6 +3,7 @@
 一个偏实验性质的 FP8 bench。当前内置了从旧实验迁过来的一组实现：
 
 - per-tensor scaling Triton quant，支持 E4M3 / E5M2；
+- per-channel scaling Triton quant，BMM 中 A 按 M 维、B 按 N 维量化；
 - FP8 BMM，右矩阵逻辑 shape 固定为 `[B,K,N]`，支持 N-major、
   预先 K-major 和 N-major 显式重排三条路径；
 - 旧 benchmark 的 quant/BMM shapes；
@@ -108,6 +109,27 @@ triton_per_tensor_n_transpose   N-major B，在 BMM wrapper 内显式重排成 K
 精度输出中，`kernel_rel_l2` 对比相同 FP8 输入的 FP32 累加 reference，
 `pipeline_rel_l2` 对比原始输入的 FP32 BMM。
 
+Per-channel BMM 使用同样的三种路径：
+
+```text
+triton_per_channel_n
+triton_per_channel_k
+triton_per_channel_n_transpose
+```
+
+其中 A 的 dequant scale shape 为 `[B,M]`，B 为 `[B,N]`，两者在 BMM
+kernel 中广播相乘。快速验证三条路径：
+
+```bash
+python3 -m fp8_bench.bench_bmm \
+  --suite smoke \
+  --impl triton_per_channel_n \
+  --impl triton_per_channel_k \
+  --impl triton_per_channel_n_transpose \
+  --mode both \
+  --warmup 5 --iters 20 --repeats 3
+```
+
 BMM 使用 `2 * B * M * N * K` 计算 FLOPs，终端和 JSONL 都会输出：
 
 ```text
@@ -164,6 +186,22 @@ ncu \
 `triton_per_tensor_n_transpose` 即可 profile 另外两条路径。这里的
 kernel-name 过滤器只采集最终 BMM kernel；显式重排的端到端成本以
 `bench_bmm` 的 `bmm-only` 时间为准。
+
+Per-channel BMM 的 NCU 命令：
+
+```bash
+ncu \
+  --set basic \
+  --kernel-name 'regex:.*batch_fp8_per_channel_bmm_kernel.*' \
+  --launch-skip 5 \
+  --launch-count 1 \
+  -o reports/per_channel_n \
+  python3 -m fp8_bench.profile_one \
+    --op bmm \
+    --case bmm_smoke_aligned \
+    --impl triton_per_channel_n \
+    --warmup 5
+```
 
 如果只想快速看报告，把 `--set full` 改为 `--set basic`。
 

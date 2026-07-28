@@ -37,9 +37,21 @@ def profile_bmm(args: argparse.Namespace) -> None:
     fp8_dtype = parse_dtype(args.fp8_dtype)
     a = torch.randn((batch, m, k), device="cuda", dtype=input_dtype)
     b = torch.randn((batch, k, n), device="cuda", dtype=input_dtype)
-    qa = quant_impl.fn(a, fp8_dtype=fp8_dtype, profile=True)
-    qb = impl.prepare_b(quant_impl.fn(b, fp8_dtype=fp8_dtype, profile=True))
-    combined_dequant_scale = qa.dequant_scale * qb.dequant_scale
+    qa = quant_impl.fn(
+        a,
+        fp8_dtype=fp8_dtype,
+        profile=True,
+        **impl.quant_a_kwargs,
+    )
+    qb = impl.prepare_b(
+        quant_impl.fn(
+            b,
+            fp8_dtype=fp8_dtype,
+            profile=True,
+            **impl.quant_b_kwargs,
+        )
+    )
+    call_kwargs = impl.prepare_call_kwargs(qa, qb)
     out = torch.empty((batch, m, n), device="cuda", dtype=out_dtype)
     for _ in range(args.warmup):
         impl.fn(
@@ -47,8 +59,8 @@ def profile_bmm(args: argparse.Namespace) -> None:
             qb,
             out_dtype=out_dtype,
             out=out,
-            dequant_scale=combined_dequant_scale,
             profile=True,
+            **call_kwargs,
         )
     torch.cuda.synchronize()
     impl.fn(
@@ -56,8 +68,8 @@ def profile_bmm(args: argparse.Namespace) -> None:
         qb,
         out_dtype=out_dtype,
         out=out,
-        dequant_scale=combined_dequant_scale,
         profile=True,
+        **call_kwargs,
     )
     torch.cuda.synchronize()
 

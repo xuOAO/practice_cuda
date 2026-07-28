@@ -79,7 +79,7 @@ def batch_fp8_per_channel_bmm_kernel(
     dequant_scale_a = tl.load(
         dequant_scale_a_ptr + batch * stride_scale_ab + off_m * stride_scale_ax,
         mask=off_m < m,
-        padding_option="zero",
+        other=0.0,
     ).to(tl.float32)
     dequant_scale_b = tl.load(
         dequant_scale_b_ptr + batch * stride_scale_bb + off_n * stride_scale_bx,

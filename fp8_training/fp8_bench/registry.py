@@ -15,7 +15,18 @@ class QuantResult:
     meta: dict[str, Any] = field(default_factory=dict)
 
     def dequantize(self, dtype: torch.dtype = torch.float32) -> torch.Tensor:
-        return self.tensor.to(dtype) * self.dequant_scale.to(dtype)
+        scale = self.dequant_scale.to(dtype)
+        channel_axis = self.meta.get("channel_axis")
+        if channel_axis in {-1, -2}:
+            expected_ndim = self.tensor.ndim - 1
+            if scale.ndim != expected_ndim:
+                raise ValueError(
+                    "per-channel dequant scale must have one fewer dimension "
+                    f"than its tensor: tensor={tuple(self.tensor.shape)}, "
+                    f"scale={tuple(scale.shape)}"
+                )
+            scale = scale.unsqueeze(-1 if channel_axis == -2 else -2)
+        return self.tensor.to(dtype) * scale
 
 
 @dataclass(frozen=True)
@@ -32,6 +43,9 @@ class BMMImpl:
     quant_impl: str
     layout: str
     prepare_b: Callable[[QuantResult], QuantResult]
+    quant_a_kwargs: dict[str, Any]
+    quant_b_kwargs: dict[str, Any]
+    prepare_call_kwargs: Callable[[QuantResult, QuantResult], dict[str, Any]]
     description: str = ""
 
 
@@ -53,6 +67,11 @@ def register_bmm(
     quant_impl: str,
     layout: str,
     prepare_b: Callable[[QuantResult], QuantResult],
+    quant_a_kwargs: dict[str, Any] | None = None,
+    quant_b_kwargs: dict[str, Any] | None = None,
+    prepare_call_kwargs: (
+        Callable[[QuantResult, QuantResult], dict[str, Any]] | None
+    ) = None,
     description: str = "",
 ) -> None:
     if name in BMM_IMPLS:
@@ -65,6 +84,9 @@ def register_bmm(
         quant_impl,
         layout,
         prepare_b,
+        dict(quant_a_kwargs or {}),
+        dict(quant_b_kwargs or {}),
+        prepare_call_kwargs or (lambda _a, _b: {}),
         description,
     )
 

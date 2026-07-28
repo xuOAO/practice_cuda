@@ -259,6 +259,9 @@ register_bmm(
     quant_impl="triton_per_tensor",
     layout="n",
     prepare_b=lambda value: prepare_b_layout(value, "n"),
+    prepare_call_kwargs=lambda a, b: {
+        "dequant_scale": a.dequant_scale * b.dequant_scale
+    },
     description="Migrated FP8 BMM with contiguous [B,K,N] right operand.",
 )
 register_bmm(
@@ -267,6 +270,9 @@ register_bmm(
     quant_impl="triton_per_tensor",
     layout="k",
     prepare_b=lambda value: prepare_b_layout(value, "k"),
+    prepare_call_kwargs=lambda a, b: {
+        "dequant_scale": a.dequant_scale * b.dequant_scale
+    },
     description="FP8 BMM with a prepacked K-major [B,K,N] right operand.",
 )
 register_bmm(
@@ -275,5 +281,8 @@ register_bmm(
     quant_impl="triton_per_tensor",
     layout="n",
     prepare_b=lambda value: prepare_b_layout(value, "n"),
+    prepare_call_kwargs=lambda a, b: {
+        "dequant_scale": a.dequant_scale * b.dequant_scale
+    },
     description="N-major FP8 BMM with explicit N-to-K packing inside the call.",
 )
