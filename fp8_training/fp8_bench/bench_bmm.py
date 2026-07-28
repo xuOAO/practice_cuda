@@ -130,6 +130,10 @@ def main() -> None:
                 pipeline_perf["tflops"] = flops / pipeline_perf["median_ms"] / 1e9
                 values["bmm_performance"] = kernel_perf
                 values["pipeline_performance"] = pipeline_perf
+                # Keep these at the top level as well so JSONL consumers do
+                # not have to understand the timing payload structure.
+                values["bmm_tflops"] = kernel_perf["tflops"]
+                values["pipeline_tflops"] = pipeline_perf["tflops"]
                 print_perf(
                     f"bmm-only {case.name} [{impl_name}]",
                     kernel_perf,
@@ -166,6 +170,7 @@ def main() -> None:
                     f"accuracy {case.name} [{impl_name}]"
                     f"  kernel_rel_l2={kernel_metrics['rel_l2']:.6g}"
                     f" pipeline_rel_l2={pipeline_metrics['rel_l2']:.6g}"
+                    f" pipeline_mse={pipeline_metrics['mse']:.6g}"
                     f" cosine={pipeline_metrics['cosine']:.6g}"
                 )
 

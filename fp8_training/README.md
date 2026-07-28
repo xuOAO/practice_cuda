@@ -16,7 +16,7 @@ cd /path/to/practice_cuda/fp8_training
 ## 先检查远端环境
 
 ```bash
-python -m fp8_bench.doctor
+python3 -m fp8_bench.doctor
 ```
 
 依赖由远端环境提供，只要求能正常 import `torch` 和 `triton`。FP8 BMM
@@ -27,7 +27,7 @@ python -m fp8_bench.doctor
 先跑小 shape：
 
 ```bash
-python -m fp8_bench.bench_quant \
+python3 -m fp8_bench.bench_quant \
   --suite smoke \
   --impl triton_per_tensor \
   --mode both
@@ -36,7 +36,7 @@ python -m fp8_bench.bench_quant \
 跑迁移过来的全部 shape，只测性能：
 
 ```bash
-python -m fp8_bench.bench_quant \
+python3 -m fp8_bench.bench_quant \
   --suite legacy \
   --impl triton_per_tensor \
   --mode perf \
@@ -46,7 +46,7 @@ python -m fp8_bench.bench_quant \
 只跑一个 case：
 
 ```bash
-python -m fp8_bench.bench_quant \
+python3 -m fp8_bench.bench_quant \
   --suite legacy \
   --case q_b32_m2048_k960 \
   --impl triton_per_tensor
@@ -57,7 +57,7 @@ python -m fp8_bench.bench_quant \
 小 shape，同时测纯 BMM、quant+BMM 和精度：
 
 ```bash
-python -m fp8_bench.bench_bmm \
+python3 -m fp8_bench.bench_bmm \
   --suite smoke \
   --impl triton_per_tensor_n \
   --impl triton_per_tensor_k \
@@ -67,7 +67,7 @@ python -m fp8_bench.bench_bmm \
 全量旧 shape，只测性能：
 
 ```bash
-python -m fp8_bench.bench_bmm \
+python3 -m fp8_bench.bench_bmm \
   --suite legacy \
   --impl triton_per_tensor_n \
   --impl triton_per_tensor_k \
@@ -78,7 +78,7 @@ python -m fp8_bench.bench_bmm \
 指定 shape、输出类型和 bias：
 
 ```bash
-python -m fp8_bench.bench_bmm \
+python3 -m fp8_bench.bench_bmm \
   --suite legacy \
   --case b16_m512_n960_k1280 \
   --impl triton_per_tensor_n \
@@ -91,6 +91,19 @@ python -m fp8_bench.bench_bmm \
 `bmm-only` 的计时不包含 quant；`pipeline` 包含 A/B quant、K-order 所需的
 layout 转换和 BMM。精度输出中，`kernel_rel_l2` 对比相同 FP8 输入的 FP32
 累加 reference，`pipeline_rel_l2` 对比原始输入的 FP32 BMM。
+
+BMM 使用 `2 * B * M * N * K` 计算 FLOPs，终端和 JSONL 都会输出：
+
+```text
+bmm_tflops       # 只计算预量化后的 BMM kernel
+pipeline_tflops  # quant A + quant B + layout + BMM 的等效吞吐
+```
+
+Quant 没有适合的 TFLOPS 定义，因此单独使用读写有效带宽 `bandwidth_gbps`。
+
+Quant 和 BMM 精度结果统一包含 `mean_abs`、`max_abs`、`mse`、`rmse`、
+`rel_l2`、`cosine` 以及 NaN/Inf 计数。BMM 会分别记录 kernel reference
+和完整 FP8 pipeline reference 两组指标。
 
 ## NCU
 
@@ -107,7 +120,7 @@ ncu \
   --launch-skip 5 \
   --launch-count 1 \
   -o reports/quant_q_b32_m2048_k960 \
-  python -m fp8_bench.profile_one \
+  python3 -m fp8_bench.profile_one \
     --op quant \
     --case q_b32_m2048_k960 \
     --impl triton_per_tensor \
@@ -124,7 +137,7 @@ ncu \
   --launch-skip 5 \
   --launch-count 1 \
   -o reports/bmm_b16_m512_n960_k1280 \
-  python -m fp8_bench.profile_one \
+  python3 -m fp8_bench.profile_one \
     --op bmm \
     --case b16_m512_n960_k1280 \
     --impl triton_per_tensor_n \
@@ -160,6 +173,10 @@ torchrun --standalone --nproc_per_node=8 \
 estimator 做 backward，但 matmul 仍是 BF16。它用于先验证 FSDP2
 端到端框架，不应该被当成 FP8 BMM 性能数据。以后有支持 backward 的实现时，
 替换 `BenchLinear` 即可。
+
+FSDP2 额外输出 `estimated_gemm_tflops`。它按两层 Linear 的 forward、
+dgrad 和 wgrad 估算 GEMM FLOPs，不包含通信、LayerNorm、激活和 optimizer，
+因此是端到端 step 下的模型 GEMM 等效吞吐，不是单 kernel TFLOPS。
 
 ## 输出
 

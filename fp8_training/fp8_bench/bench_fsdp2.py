@@ -172,6 +172,15 @@ def main() -> None:
     if rank == 0:
         median_ms = float(local_median.item())
         samples_per_second = args.batch * world_size / (median_ms / 1000)
+        # Each block has two GEMMs (H->F and F->H). Forward is 4*T*H*F
+        # FLOPs; forward + dgrad + wgrad is approximately three times that.
+        # This deliberately excludes norm, GELU, communication and optimizer
+        # work, so the metric is an estimated training GEMM throughput.
+        tokens = args.batch * args.seq * world_size
+        estimated_gemm_flops = (
+            12 * tokens * args.layers * args.hidden * args.ffn
+        )
+        estimated_gemm_tflops = estimated_gemm_flops / median_ms / 1e9
         record = {
             "kind": "fsdp2",
             "environment": environment_info(),
@@ -185,6 +194,8 @@ def main() -> None:
             "seq": args.seq,
             "median_step_ms": median_ms,
             "samples_per_second": samples_per_second,
+            "estimated_gemm_flops_per_step": estimated_gemm_flops,
+            "estimated_gemm_tflops": estimated_gemm_tflops,
             "max_peak_memory_bytes": int(peak_memory.item()),
             "first_measured_loss": losses[0],
             "last_loss": losses[-1],
@@ -194,6 +205,7 @@ def main() -> None:
         print(
             f"FSDP2 {args.impl}: {median_ms:.3f} ms/step,"
             f" {samples_per_second:.2f} samples/s,"
+            f" est_gemm={estimated_gemm_tflops:.2f} TFLOPS,"
             f" peak={peak_memory.item() / 1024**3:.2f} GiB,"
             f" loss={losses[0]:.6g}->{losses[-1]:.6g}"
         )

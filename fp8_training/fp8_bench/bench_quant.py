@@ -101,6 +101,7 @@ def main() -> None:
                     f"accuracy {case.name} [{impl_name}]"
                     f"  rel_l2={metrics['rel_l2']:.6g}"
                     f" cosine={metrics['cosine']:.6g}"
+                    f" mse={metrics['mse']:.6g}"
                     f" max_abs={metrics['max_abs']:.6g}"
                 )
 

@@ -5,9 +5,11 @@ from typing import Optional
 import torch
 import triton
 
-from fp8_bench.kernels import (
+from fp8_bench.kernels.bmm.per_tensor import (
     batch_fp8_bmm_kernel,
     batch_fp8_bmm_kernel_autotuned,
+)
+from fp8_bench.kernels.quant.per_tensor import (
     fp8_quant_kernel,
     fp8_quant_kernel_autotuned,
 )

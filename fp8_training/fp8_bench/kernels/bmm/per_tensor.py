@@ -5,58 +5,6 @@ import triton.language as tl
 
 
 @triton.jit
-def fp8_quant_kernel(
-    x_ptr,
-    y_ptr,
-    m,
-    n,
-    stride_xb,
-    stride_xm,
-    stride_xn,
-    stride_yb,
-    stride_ym,
-    stride_yn,
-    scale_ptr,
-    fp8_max: tl.constexpr,
-    dim: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    batch = tl.program_id(1)
-    if dim == 3:
-        x_ptr += batch * stride_xb
-        y_ptr += batch * stride_yb
-
-    grid_n = tl.cdiv(n, BLOCK_N)
-    pid_m = pid // grid_n
-    pid_n = pid % grid_n
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    mask = (offs_m[:, None] < m) & (offs_n[None, :] < n)
-    x_offsets = offs_m[:, None] * stride_xm + offs_n[None, :] * stride_xn
-    y_offsets = offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
-
-    value = tl.load(x_ptr + x_offsets, mask=mask, other=0.0).to(tl.float32)
-    scale = tl.load(scale_ptr)
-    value = tl.clamp(value * scale, min=-fp8_max, max=fp8_max)
-    tl.store(y_ptr + y_offsets, value, mask=mask)
-
-
-_QUANT_CONFIGS = [
-    triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=3),
-    triton.Config({"BLOCK_M": 32, "BLOCK_N": 128}, num_warps=4, num_stages=3),
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=8, num_stages=3),
-]
-
-fp8_quant_kernel_autotuned = triton.autotune(
-    configs=_QUANT_CONFIGS,
-    key=["m", "n"],
-)(fp8_quant_kernel)
-
-
-@triton.jit
 def batch_fp8_bmm_kernel(
     a_ptr,
     b_ptr,
@@ -148,7 +96,7 @@ def batch_fp8_bmm_kernel(
     tl.store(c_block, accumulator.to(c_ptr.dtype.element_ty), boundary_check=(0, 1))
 
 
-_BMM_CONFIGS = [
+_CONFIGS = [
     triton.Config(
         {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_M": 8},
         num_warps=4,
@@ -182,6 +130,6 @@ _BMM_CONFIGS = [
 ]
 
 batch_fp8_bmm_kernel_autotuned = triton.autotune(
-    configs=_BMM_CONFIGS,
+    configs=_CONFIGS,
     key=["m", "n", "k", "B_N_ORDER", "USE_BIAS"],
 )(batch_fp8_bmm_kernel)

@@ -90,6 +90,8 @@ def accuracy_metrics(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, 
     expected_f = expected.float()
     finite = torch.isfinite(actual_f)
     diff = actual_f - expected_f
+    squared_diff = diff.square()
+    mse = squared_diff.mean()
     expected_norm = torch.linalg.vector_norm(expected_f)
     diff_norm = torch.linalg.vector_norm(diff)
     denom = torch.clamp(expected_norm, min=1e-12)
@@ -103,6 +105,8 @@ def accuracy_metrics(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, 
         "inf_count": int(torch.isinf(actual_f).sum().item()),
         "max_abs": float(diff.abs().max().item()),
         "mean_abs": float(diff.abs().mean().item()),
+        "mse": float(mse.item()),
+        "rmse": float(mse.sqrt().item()),
         "rel_l2": float((diff_norm / denom).item()),
         "cosine": float((torch.sum(actual_f * expected_f) / cosine_denom).item()),
     }
