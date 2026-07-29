@@ -195,6 +195,70 @@ Quant 和 BMM 精度结果统一包含 `mean_abs`、`max_abs`、`mse`、`rmse`�
 `rel_l2`、`cosine` 以及 NaN/Inf 计数。BMM 会分别记录 kernel reference
 和完整 FP8 pipeline reference 两组指标。
 
+## Autotune config 搜索
+
+`fp8_bench.tuning` 是离线搜索工具，不会修改 kernel 中现有的
+`_CONFIGS`。它按下面的顺序工作：
+
+1. 根据所选 suite 的最大 M/N/K 和命令行上限生成 2 的幂搜索空间；
+2. 编译并加载每个 cubin，过滤编译失败、spill/local memory、资源超限、
+   occupancy 为零以及没有生成 WGMMA/HGMMA 的配置；
+3. 用 tile/wave efficiency 粗排，短测候选，再对前几名做正式复测；
+4. 写出完整 JSONL 和每个 shape 的最佳配置 JSON。
+
+例如搜索 per-tensor N-major：
+
+```bash
+python3 -m fp8_bench.tuning.search_bmm \
+  --suite legacy \
+  --impl triton_per_tensor_n \
+  --block-m-cap 256 \
+  --block-n-cap 256 \
+  --block-k-cap 256
+```
+
+搜索 per-channel K-major：
+
+```bash
+python3 -m fp8_bench.tuning.search_bmm \
+  --suite legacy \
+  --impl triton_per_channel_k
+```
+
+Per-block 会额外按 `QBK >= BLOCK_K` 且 `QBK % BLOCK_K == 0` 过滤：
+
+```bash
+python3 -m fp8_bench.tuning.search_bmm \
+  --suite legacy \
+  --impl triton_per_block_n \
+  --quant-block-m 128 \
+  --quant-block-k 256 \
+  --quant-block-n 128
+```
+
+默认搜索 `BM>=64、BN>=8、BK>=32`，并要求 WGMMA/HGMMA 和零 spill。
+调试非 Hopper 环境或检查过滤逻辑时，可临时使用
+`--no-require-wgmma`、`--no-reject-local-memory` 或
+`--no-static-resource-filter`。`--prebench-top-k 0` 会短测所有通过编译
+筛选的配置；默认只短测启发式排名前 64 个，再正式复测前 8 个。
+
+默认结果写到：
+
+```text
+results/tuning/<impl>_<suite>.jsonl
+results/tuning/<impl>_<suite>.best.json
+```
+
+JSONL 会保留每个 config 的编译失败原因、寄存器、local/shared memory、
+occupancy、是否找到 WGMMA、短测和复测时间。`.best.json` 中同时有
+结构化的 `unique_configs` 和可直接整理回 kernel `_CONFIGS` 的
+`triton_configs` 字符串。
+
+`*_n_transpose` 搜索的是显式重排之后的 K-major BMM kernel 配置，不把
+transpose 时间混进 config 选择；端到端 transpose 成本仍由
+`bench_bmm` 测量。之后增加 TMA kernel 时，只需在
+`fp8_bench/tuning/adapters.py` 增加一个 adapter，不需要改搜索器。
+
 ## NCU
 
 profile target 默认 warmup 5 次，然后再 launch 一次。NCU 用
