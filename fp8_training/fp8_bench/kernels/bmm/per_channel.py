@@ -115,6 +115,127 @@ def batch_fp8_per_channel_bmm_kernel(
     tl.store(c_block, accumulator.to(c_ptr.dtype.element_ty), boundary_check=(0, 1))
 
 
+@triton.jit
+def batch_fp8_per_channel_bmm_tma_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    bias_ptr,
+    dequant_scale_a_ptr,
+    dequant_scale_b_ptr,
+    m,
+    n,
+    k,
+    stride_ab,
+    stride_am,
+    stride_ak,
+    stride_bb,
+    stride_bk,
+    stride_bn,
+    stride_cb,
+    stride_cm,
+    stride_cn,
+    stride_biasb,
+    stride_biasm,
+    stride_biasn,
+    stride_scale_ab,
+    stride_scale_ax,
+    stride_scale_bb,
+    stride_scale_bx,
+    USE_BIAS: tl.constexpr,
+    B_N_MAJOR: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    batch = tl.program_id(1)
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(m, BLOCK_M)
+    num_pid_n = tl.cdiv(n, BLOCK_N)
+    num_pid_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_group
+    first_pid_m = group_id * GROUP_M
+    group_m = min(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + (pid % num_pid_group) % group_m
+    pid_n = (pid % num_pid_group) // group_m
+
+    a_desc = tl.make_tensor_descriptor(
+        base=a_ptr + batch * stride_ab,
+        shape=[m, k],
+        strides=[stride_am, stride_ak],
+        block_shape=[BLOCK_M, BLOCK_K],
+        padding_option="zero",
+    )
+    if B_N_MAJOR:
+        b_desc = tl.make_tensor_descriptor(
+            base=b_ptr + batch * stride_bb,
+            shape=[k, n],
+            strides=[stride_bk, stride_bn],
+            block_shape=[BLOCK_K, BLOCK_N],
+            padding_option="zero",
+        )
+    else:
+        # K-major B: the [K,N] tile is fetched as a transposed [N,K] block so
+        # that the descriptor's last (contiguous) dimension is K.
+        b_desc = tl.make_tensor_descriptor(
+            base=b_ptr + batch * stride_bb,
+            shape=[n, k],
+            strides=[stride_bn, stride_bk],
+            block_shape=[BLOCK_N, BLOCK_K],
+            padding_option="zero",
+        )
+
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+    for kk in tl.range(0, k, BLOCK_K):
+        a = a_desc.load([pid_m * BLOCK_M, kk])
+        if B_N_MAJOR:
+            b = b_desc.load([kk, pid_n * BLOCK_N])
+        else:
+            b = tl.trans(b_desc.load([pid_n * BLOCK_N, kk]))
+        accumulator = tl.dot(a, b, accumulator)
+
+    off_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    off_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    dequant_scale_a = tl.load(
+        dequant_scale_a_ptr + batch * stride_scale_ab + off_m * stride_scale_ax,
+        mask=off_m < m,
+        other=0.0,
+    ).to(tl.float32)
+    dequant_scale_b = tl.load(
+        dequant_scale_b_ptr + batch * stride_scale_bb + off_n * stride_scale_bx,
+        mask=off_n < n,
+        other=0.0
+    ).to(tl.float32)
+    dequant_scale = dequant_scale_a[:, None] * dequant_scale_b[None, :]
+
+    accumulator *= dequant_scale
+    if USE_BIAS:
+        bias_block = tl.make_block_ptr(
+            base=bias_ptr + batch * stride_biasb,
+            shape=(m, n),
+            strides=(stride_biasm, stride_biasn),
+            offsets=(pid_m * BLOCK_M, pid_n * BLOCK_N),
+            block_shape=(BLOCK_M, BLOCK_N),
+            order=(1, 0),
+        )
+        accumulator += tl.load(
+            bias_block,
+            boundary_check=(0, 1),
+            padding_option="zero",
+        )
+
+    c_block = tl.make_block_ptr(
+        base=c_ptr + batch * stride_cb,
+        shape=(m, n),
+        strides=(stride_cm, stride_cn),
+        offsets=(pid_m * BLOCK_M, pid_n * BLOCK_N),
+        block_shape=(BLOCK_M, BLOCK_N),
+        order=(1, 0),
+    )
+    tl.store(c_block, accumulator.to(c_ptr.dtype.element_ty), boundary_check=(0, 1))
+
+
 _CONFIGS = [
     triton.Config(
         {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_M": 8},
@@ -152,3 +273,8 @@ batch_fp8_per_channel_bmm_kernel_autotuned = triton.autotune(
     configs=_CONFIGS,
     key=["m", "n", "k", "B_N_MAJOR", "USE_BIAS"],
 )(batch_fp8_per_channel_bmm_kernel)
+
+batch_fp8_per_channel_bmm_tma_kernel_autotuned = triton.autotune(
+    configs=_CONFIGS,
+    key=["m", "n", "k", "B_N_MAJOR", "USE_BIAS"],
+)(batch_fp8_per_channel_bmm_tma_kernel)

@@ -9,6 +9,8 @@ import triton
 from fp8_bench.kernels.bmm.per_block import (
     batch_fp8_per_block_bmm_kernel,
     batch_fp8_per_block_bmm_kernel_autotuned,
+    batch_fp8_per_block_bmm_tma_kernel,
+    batch_fp8_per_block_bmm_tma_kernel_autotuned,
 )
 from fp8_bench.kernels.quant.per_block import (
     fp8_per_block_quant_kernel,
@@ -23,6 +25,10 @@ from fp8_bench.registry import (
 _DEFAULT_QUANT_BLOCK_M = 128
 _DEFAULT_QUANT_BLOCK_K = 128
 _DEFAULT_QUANT_BLOCK_N = 128
+
+
+def alloc_fn(size: int, alignment: int, stream: Optional[int]):
+    return torch.empty(size, device="cuda", dtype=torch.int8)
 
 
 def _matrix_layout(tensor: torch.Tensor, name: str) -> str:
@@ -211,6 +217,7 @@ def triton_per_block_bmm(
     out: Optional[torch.Tensor] = None,
     do_transpose_b: bool = False,
     profile: bool = False,
+    use_tma: bool = False,
 ) -> torch.Tensor:
     if a.tensor.ndim != 3 or b.tensor.ndim != 3:
         raise ValueError("BMM expects 3D quantized tensors")
@@ -321,11 +328,19 @@ def triton_per_block_bmm(
         triton.cdiv(m, meta["BLOCK_M"]) * triton.cdiv(n, meta["BLOCK_N"]),
         batch,
     )
-    kernel = (
-        batch_fp8_per_block_bmm_kernel
-        if profile
-        else batch_fp8_per_block_bmm_kernel_autotuned
-    )
+    if use_tma:
+        triton.set_allocator(alloc_fn)
+        kernel = (
+            batch_fp8_per_block_bmm_tma_kernel
+            if profile
+            else batch_fp8_per_block_bmm_tma_kernel_autotuned
+        )
+    else:
+        kernel = (
+            batch_fp8_per_block_bmm_kernel
+            if profile
+            else batch_fp8_per_block_bmm_kernel_autotuned
+        )
     launch_kwargs = {
         "QUANT_BLOCK_M": expected_block_m,
         "QUANT_BLOCK_K": expected_block_k,
