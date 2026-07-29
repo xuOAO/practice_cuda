@@ -69,6 +69,12 @@ def main() -> None:
     parser.add_argument("--quant-block-k", type=int)
     parser.add_argument("--quant-block-n", type=int)
     parser.add_argument("--bias", action="store_true")
+    parser.add_argument(
+        "--use-tma",
+        action="store_true",
+        help="Use the TMA-backed kernel variants (requires 16-byte aligned "
+        "M/N/K, i.e. dims multiples of 16 for fp8).",
+    )
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--repeats", type=int, default=5)
@@ -131,6 +137,7 @@ def main() -> None:
                 "out_dtype": str(out_dtype),
                 "fp8_dtype": str(fp8_dtype),
                 "bias": args.bias,
+                "use_tma": args.use_tma,
                 "seed": args.seed,
             }
             flops = 2 * batch * m * n * k
@@ -143,6 +150,7 @@ def main() -> None:
                         out_dtype=out_dtype,
                         bias=bias,
                         out=out,
+                        use_tma=args.use_tma,
                         **call_kwargs,
                     ),
                     warmup=args.warmup,
@@ -171,6 +179,7 @@ def main() -> None:
                         out_dtype=out_dtype,
                         bias=bias,
                         out=out,
+                        use_tma=args.use_tma,
                         **run_call_kwargs,
                     )
 
@@ -205,6 +214,7 @@ def main() -> None:
                     out_dtype=out_dtype,
                     bias=bias,
                     out=out,
+                    use_tma=args.use_tma,
                     **call_kwargs,
                 )
                 dequant_a = qa.dequantize()
