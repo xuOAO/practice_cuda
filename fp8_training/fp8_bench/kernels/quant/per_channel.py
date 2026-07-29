@@ -27,8 +27,6 @@ def fp8_per_channel_quant_kernel(
     BLOCK_N: tl.constexpr,
     EPS: tl.constexpr,
 ):
-    tl.static_assert(channel_axis in (-1, -2), "channel_axis must be -1 or -2")
-
     pid = tl.program_id(0)
     batch = tl.program_id(1)
     if dim == 3:

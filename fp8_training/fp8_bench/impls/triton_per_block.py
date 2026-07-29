@@ -6,13 +6,13 @@ from typing import Optional
 import torch
 import triton
 
-from fp8_bench.kernels.bmm.per_channel import (
+from fp8_bench.kernels.bmm.per_block import (
     batch_fp8_per_channel_bmm_kernel,
     batch_fp8_per_channel_bmm_kernel_autotuned,
 )
-from fp8_bench.kernels.quant.per_channel import (
-    fp8_per_channel_quant_kernel,
-    fp8_per_channel_quant_kernel_autotuned,
+from fp8_bench.kernels.quant.per_block import (
+    fp8_per_block_quant_kernel,
+    fp8_per_block_quant_kernel_autotuned,
 )
 from fp8_bench.registry import (
     QuantResult,
@@ -32,10 +32,11 @@ def _matrix_layout(tensor: torch.Tensor, name: str) -> str:
     )
 
 
-def triton_per_channel_quant(
+def triton_per_block_quant(
     x: torch.Tensor,
     *,
-    channel_axis: int = -1,
+    block_m: int = 128,
+    block_n: int = 128,
     fp8_dtype: torch.dtype = torch.float8_e4m3fn,
     eps: float = 1e-12,
     profile: bool = False,
@@ -44,10 +45,7 @@ def triton_per_channel_quant(
         raise ValueError(
             f"per-channel quant expects a 2D or 3D tensor, got {tuple(x.shape)}"
         )
-    if channel_axis not in {-1, -2}:
-        raise ValueError(f"channel_axis must be -1 or -2, got {channel_axis}")
 
-    x_n_major = _matrix_layout(x, "quant input") == "n-major"
     output = torch.empty(x.shape, device=x.device, dtype=fp8_dtype)
     if x.ndim == 2:
         batch = 1
@@ -58,30 +56,35 @@ def triton_per_channel_quant(
         stride_xb = x.stride(0)
         stride_yb = output.stride(0)
 
-    channel_size = m if channel_axis == -2 else n
+    assert m >= block_m and n >= block_n, (
+        f"per-block quant requires m >= block_m and n >= block_n; "
+        f"got m={m}, n={n}, block_m={block_m}, block_n={block_n}"
+    )
+
+    m_blocks = (m + block_m - 1) // block_m
+    n_blocks = (n + block_n - 1) // block_n
+
     scale_storage = torch.empty(
-        (batch, channel_size),
+        (batch, m_blocks, n_blocks),
         device=x.device,
         dtype=torch.float32,
     )
     grid = lambda meta: (
-        triton.cdiv(
-            m if channel_axis == -2 else n,
-            meta["BLOCK_M"] if channel_axis == -2 else meta["BLOCK_N"],
-        ),
+        m_blocks,
+        n_blocks,
         batch,
     )
 
     kernel = (
-        fp8_per_channel_quant_kernel
+        fp8_per_block_quant_kernel
         if profile
-        else fp8_per_channel_quant_kernel_autotuned
+        else fp8_per_block_quant_kernel_autotuned
     )
-    launch_kwargs = {}
+    launch_kwargs = {"BLOCK_M": block_m, "BLOCK_N": block_n}
     if profile:
         launch_kwargs = {
-            "BLOCK_M": 64,
-            "BLOCK_N": 128,
+            "BLOCK_M": block_m,
+            "BLOCK_N": block_n,
             "num_warps": 4,
             "num_stages": 3,
         }
@@ -97,11 +100,7 @@ def triton_per_channel_quant(
         output.stride(-2),
         output.stride(-1),
         scale_storage,
-        scale_storage.stride(0),
-        scale_storage.stride(1),
-        channel_axis=channel_axis,
-        X_N_MAJOR=x_n_major,
-        Y_N_MAJOR=True,
+        *scale_storage.stride(),
         fp8_max=torch.finfo(fp8_dtype).max,
         dim=x.ndim,
         EPS=eps,
@@ -111,12 +110,13 @@ def triton_per_channel_quant(
     return QuantResult(
         tensor=output,
         dequant_scale=dequant_scale,
-        impl="triton_per_channel",
-        granularity="channel",
+        impl="triton_per_block",
+        granularity="block",
         meta={
             "logical_shape": tuple(x.shape),
             "fp8_dtype": str(fp8_dtype),
-            "channel_axis": channel_axis,
+            "block_m": block_m,
+            "block_n": block_n,
         },
     )
 
@@ -139,7 +139,8 @@ def _validate_scale(
     value: QuantResult,
     *,
     expected_shape: tuple[int, int],
-    expected_axis: int,
+    expected_block_m: int,
+    expected_block_n: int,
     operand: str,
 ) -> None:
     scale = value.dequant_scale
@@ -157,14 +158,14 @@ def _validate_scale(
             f"{operand} dequant scale must be on {value.tensor.device}, "
             f"got {scale.device}"
         )
-    if value.meta.get("channel_axis") != expected_axis:
+    if value.meta.get("block_m") != expected_block_m or value.meta.get("block_n") != expected_block_n:
         raise ValueError(
-            f"{operand} must be quantized with channel_axis={expected_axis}, "
-            f"got {value.meta.get('channel_axis')}"
+            f"{operand} must be quantized with block_m={expected_block_m} and block_n={expected_block_n}, "
+            f"got block_m={value.meta.get('block_m')} and block_n={value.meta.get('block_n')}"
         )
 
 
-def triton_per_channel_bmm(
+def triton_per_block_bmm(
     a: QuantResult,
     b: QuantResult,
     *,
@@ -213,16 +214,25 @@ def triton_per_channel_bmm(
             f"B={b_tensor.dtype}"
         )
 
+    expected_block_m = a.meta.get("block_m")
+    expected_block_k = a.meta.get("block_n")
+    expected_block_n = b.meta.get("block_n")
+    num_blocks_m = (m + expected_block_m - 1) // expected_block_m
+    num_blocks_k = (k + expected_block_k - 1) // expected_block_k
+    num_blocks_n = (n + expected_block_n - 1) // expected_block_n
+
     _validate_scale(
         a,
-        expected_shape=(batch, m),
-        expected_axis=-2,
+        expected_shape=(num_blocks_m, num_blocks_k),
+        expected_block_m=expected_block_m,
+        expected_block_n=expected_block_k,
         operand="A",
     )
     _validate_scale(
         b,
-        expected_shape=(batch, n),
-        expected_axis=-1,
+        expected_shape=(num_blocks_k, num_blocks_n),
+        expected_block_m=expected_block_k,
+        expected_block_n=expected_block_n,
         operand="B",
     )
 
@@ -264,13 +274,22 @@ def triton_per_channel_bmm(
         if profile
         else batch_fp8_per_channel_bmm_kernel_autotuned
     )
-    launch_kwargs = {}
+    launch_kwargs = {
+        "QUANT_BLOCK_M": expected_block_m,
+        "QUANT_BLOCK_K": expected_block_k,
+        "QUANT_BLOCK_N": expected_block_n,
+        "NUM_QUANT_BLOCK_K": num_blocks_k,
+    }
     if profile:
         launch_kwargs = {
             "BLOCK_M": 64,
             "BLOCK_N": 64,
             "BLOCK_K": 128,
             "GROUP_M": 8,
+            "QUANT_BLOCK_M": expected_block_m,
+            "QUANT_BLOCK_K": expected_block_k,
+            "QUANT_BLOCK_N": expected_block_n,
+            "NUM_QUANT_BLOCK_K": num_blocks_k,
             "num_warps": 4,
             "num_stages": 3,
         }
@@ -300,14 +319,14 @@ def triton_per_channel_bmm(
 
 
 register_quant(
-    "triton_per_channel",
-    triton_per_channel_quant,
+    "triton_per_block",
+    triton_per_block_quant,
     "Per-channel scale quantization; supports E4M3 and E5M2.",
 )
 register_bmm(
-    "triton_per_channel_n",
-    partial(triton_per_channel_bmm, do_transpose_b=False),
-    quant_impl="triton_per_channel",
+    "triton_per_block_n",
+    partial(triton_per_block_bmm, do_transpose_b=False),
+    quant_impl="triton_per_block",
     quant_a_kwargs={"channel_axis": -2},
     quant_b_kwargs={"channel_axis": -1},
     layout="n",

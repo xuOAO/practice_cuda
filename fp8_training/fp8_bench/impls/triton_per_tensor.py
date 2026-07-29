@@ -82,6 +82,7 @@ def triton_per_tensor_quant(
         tensor=output,
         dequant_scale=dequant_scale,
         impl="triton_per_tensor",
+        granularity="tensor",
         meta={"logical_shape": tuple(x.shape), "fp8_dtype": str(fp8_dtype)},
     )
 
@@ -95,6 +96,7 @@ def prepare_b_layout(value: QuantResult, layout: str) -> QuantResult:
         tensor=value.tensor.transpose(-1, -2).contiguous().transpose(-1, -2),
         dequant_scale=value.dequant_scale,
         impl=value.impl,
+        granularity=value.granularity,
         meta={**value.meta, "layout": "k"},
     )
 

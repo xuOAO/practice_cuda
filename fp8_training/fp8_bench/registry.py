@@ -12,21 +12,54 @@ class QuantResult:
     tensor: torch.Tensor
     dequant_scale: torch.Tensor
     impl: str
+    granularity: str
     meta: dict[str, Any] = field(default_factory=dict)
 
     def dequantize(self, dtype: torch.dtype = torch.float32) -> torch.Tensor:
         scale = self.dequant_scale.to(dtype)
-        channel_axis = self.meta.get("channel_axis")
-        if channel_axis in {-1, -2}:
-            expected_ndim = self.tensor.ndim - 1
-            if scale.ndim != expected_ndim:
+        if self.granularity == "tensor":
+            return self.tensor.to(dtype) * scale
+        elif self.impl == "channel":
+            channel_axis = self.meta["channel_axis"]
+            if channel_axis in {-1, -2}:
+                expected_ndim = self.tensor.ndim - 1
+                if scale.ndim != expected_ndim:
+                    raise ValueError(
+                        "per-channel dequant scale must have one fewer dimension "
+                        f"than its tensor: tensor={tuple(self.tensor.shape)}, "
+                        f"scale={tuple(scale.shape)}"
+                    )
+                scale = scale.unsqueeze(-1 if channel_axis == -2 else -2)
+                return self.tensor.to(dtype) * scale
+            else:
                 raise ValueError(
-                    "per-channel dequant scale must have one fewer dimension "
-                    f"than its tensor: tensor={tuple(self.tensor.shape)}, "
-                    f"scale={tuple(scale.shape)}"
+                    f"unknown channel_axis for triton_per_channel: {channel_axis}"
                 )
-            scale = scale.unsqueeze(-1 if channel_axis == -2 else -2)
-        return self.tensor.to(dtype) * scale
+        elif self.impl == "block":
+            if "block_m" not in self.meta or "block_n" not in self.meta:
+                raise ValueError(
+                    "block_m and block_n must be specified in meta for triton_per_block"
+                )
+            block_m, block_n = self.meta["block_m"], self.meta["block_n"]
+            m, n = self.tensor.shape[-2:]
+            assert block_m > 0 and block_n > 0, "block_m and block_n must be positive for block granularity"
+            assert block_m <= m and block_n <= n, "block_m and block_n must be less than or equal to the tensor dimensions"
+
+            num_blocks_m = (m + block_m - 1) // block_m
+            num_blocks_n = (n + block_n - 1) // block_n
+
+            expected_shape = tuple(self.tensor.shape[:-2]) + (num_blocks_m, num_blocks_n)
+            if scale.shape != expected_shape:
+                raise ValueError(
+                    f"per-block dequant scale must have shape {expected_shape}, "
+                    f"got {tuple(scale.shape)}"
+                )
+            
+            row_block_ids = torch.arange(m, device=self.tensor.device) // block_m
+            col_block_ids = torch.arange(n, device=self.tensor.device) // block_n
+
+            scale = scale.index_select(-2, row_block_ids).index_select(-1, col_block_ids)
+            return self.tensor.to(dtype) * scale
 
 
 @dataclass(frozen=True)
