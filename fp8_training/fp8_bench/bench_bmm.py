@@ -28,6 +28,28 @@ def _cases(suite: str, case_name: str | None) -> Iterable[BMMCase]:
     return selected
 
 
+def _quant_kwargs(
+    impl,
+    *,
+    quant_block_m: int | None,
+    quant_block_k: int | None,
+    quant_block_n: int | None,
+) -> tuple[dict[str, object], dict[str, object]]:
+    a_kwargs = dict(impl.quant_a_kwargs)
+    b_kwargs = dict(impl.quant_b_kwargs)
+    if impl.quant_impl != "triton_per_block":
+        return a_kwargs, b_kwargs
+
+    if quant_block_m is not None:
+        a_kwargs["block_m"] = quant_block_m
+    if quant_block_k is not None:
+        a_kwargs["block_n"] = quant_block_k
+        b_kwargs["block_m"] = quant_block_k
+    if quant_block_n is not None:
+        b_kwargs["block_n"] = quant_block_n
+    return a_kwargs, b_kwargs
+
+
 def main() -> None:
     load_builtin_impls()
     parser = argparse.ArgumentParser(description="Benchmark FP8 BMM kernels and pipelines.")
@@ -43,6 +65,9 @@ def main() -> None:
     parser.add_argument("--input-dtype", default="bf16")
     parser.add_argument("--out-dtype", default="bf16")
     parser.add_argument("--fp8-dtype", choices=["e4m3", "e5m2"], default="e4m3")
+    parser.add_argument("--quant-block-m", type=int)
+    parser.add_argument("--quant-block-k", type=int)
+    parser.add_argument("--quant-block-n", type=int)
     parser.add_argument("--bias", action="store_true")
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
@@ -72,16 +97,22 @@ def main() -> None:
         for impl_name in impl_names:
             bmm_impl = get_bmm(impl_name)
             quant_impl = get_quant(bmm_impl.quant_impl)
+            quant_a_kwargs, quant_b_kwargs = _quant_kwargs(
+                bmm_impl,
+                quant_block_m=args.quant_block_m,
+                quant_block_k=args.quant_block_k,
+                quant_block_n=args.quant_block_n,
+            )
             qa = quant_impl.fn(
                 a,
                 fp8_dtype=fp8_dtype,
-                **bmm_impl.quant_a_kwargs,
+                **quant_a_kwargs,
             )
             qb = bmm_impl.prepare_b(
                 quant_impl.fn(
                     b,
                     fp8_dtype=fp8_dtype,
-                    **bmm_impl.quant_b_kwargs,
+                    **quant_b_kwargs,
                 )
             )
             call_kwargs = bmm_impl.prepare_call_kwargs(qa, qb)
@@ -93,8 +124,8 @@ def main() -> None:
                 "shape": case.shape,
                 "impl": impl_name,
                 "quant_impl": bmm_impl.quant_impl,
-                "quant_a_kwargs": bmm_impl.quant_a_kwargs,
-                "quant_b_kwargs": bmm_impl.quant_b_kwargs,
+                "quant_a_kwargs": quant_a_kwargs,
+                "quant_b_kwargs": quant_b_kwargs,
                 "layout": bmm_impl.layout,
                 "input_dtype": str(input_dtype),
                 "out_dtype": str(out_dtype),
@@ -124,21 +155,23 @@ def main() -> None:
                     run_qa = quant_impl.fn(
                         a,
                         fp8_dtype=fp8_dtype,
-                        **bmm_impl.quant_a_kwargs,
+                        **quant_a_kwargs,
                     )
                     run_qb = bmm_impl.prepare_b(
                         quant_impl.fn(
                             b,
                             fp8_dtype=fp8_dtype,
-                            **bmm_impl.quant_b_kwargs,
+                            **quant_b_kwargs,
                         )
                     )
+                    run_call_kwargs = bmm_impl.prepare_call_kwargs(run_qa, run_qb)
                     return bmm_impl.fn(
                         run_qa,
                         run_qb,
                         out_dtype=out_dtype,
                         bias=bias,
                         out=out,
+                        **run_call_kwargs,
                     )
 
                 pipeline_perf = benchmark_cuda(

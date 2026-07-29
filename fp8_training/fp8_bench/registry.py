@@ -19,7 +19,7 @@ class QuantResult:
         scale = self.dequant_scale.to(dtype)
         if self.granularity == "tensor":
             return self.tensor.to(dtype) * scale
-        elif self.impl == "channel":
+        if self.granularity == "channel":
             channel_axis = self.meta["channel_axis"]
             if channel_axis in {-1, -2}:
                 expected_ndim = self.tensor.ndim - 1
@@ -35,31 +35,39 @@ class QuantResult:
                 raise ValueError(
                     f"unknown channel_axis for triton_per_channel: {channel_axis}"
                 )
-        elif self.impl == "block":
+        if self.granularity == "block":
             if "block_m" not in self.meta or "block_n" not in self.meta:
                 raise ValueError(
                     "block_m and block_n must be specified in meta for triton_per_block"
                 )
             block_m, block_n = self.meta["block_m"], self.meta["block_n"]
             m, n = self.tensor.shape[-2:]
-            assert block_m > 0 and block_n > 0, "block_m and block_n must be positive for block granularity"
-            assert block_m <= m and block_n <= n, "block_m and block_n must be less than or equal to the tensor dimensions"
+            if block_m <= 0 or block_n <= 0:
+                raise ValueError(
+                    "block_m and block_n must be positive for block granularity"
+                )
 
             num_blocks_m = (m + block_m - 1) // block_m
             num_blocks_n = (n + block_n - 1) // block_n
 
-            expected_shape = tuple(self.tensor.shape[:-2]) + (num_blocks_m, num_blocks_n)
-            if scale.shape != expected_shape:
+            expected_shape = tuple(self.tensor.shape[:-2]) + (
+                num_blocks_m,
+                num_blocks_n,
+            )
+            if tuple(scale.shape) != expected_shape:
                 raise ValueError(
                     f"per-block dequant scale must have shape {expected_shape}, "
                     f"got {tuple(scale.shape)}"
                 )
-            
-            row_block_ids = torch.arange(m, device=self.tensor.device) // block_m
-            col_block_ids = torch.arange(n, device=self.tensor.device) // block_n
 
-            scale = scale.index_select(-2, row_block_ids).index_select(-1, col_block_ids)
-            return self.tensor.to(dtype) * scale
+            row_block_ids = torch.arange(m, device=scale.device) // block_m
+            col_block_ids = torch.arange(n, device=scale.device) // block_n
+            scale = scale.index_select(-2, row_block_ids).index_select(
+                -1, col_block_ids
+            )
+            dequant = self.tensor.to(dtype)
+            return dequant.mul_(scale)
+        raise ValueError(f"unknown quantization granularity: {self.granularity}")
 
 
 @dataclass(frozen=True)

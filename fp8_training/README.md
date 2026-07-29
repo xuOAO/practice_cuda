@@ -4,6 +4,7 @@
 
 - per-tensor scaling Triton quant，支持 E4M3 / E5M2；
 - per-channel scaling Triton quant，BMM 中 A 按 M 维、B 按 N 维量化；
+- per-block scaling Triton quant/BMM，默认 quant block 为 `128×128×128`；
 - FP8 BMM，右矩阵逻辑 shape 固定为 `[B,K,N]`，支持 N-major、
   预先 K-major 和 N-major 显式重排三条路径；
 - 旧 benchmark 的 quant/BMM shapes；
@@ -52,6 +53,17 @@ python3 -m fp8_bench.bench_quant \
   --suite legacy \
   --case q_b32_m2048_k960 \
   --impl triton_per_tensor
+```
+
+Per-block quant 默认使用 `128×128`，也可以覆盖 block shape：
+
+```bash
+python3 -m fp8_bench.bench_quant \
+  --suite smoke \
+  --impl triton_per_block \
+  --block-m 128 \
+  --block-n 128 \
+  --mode both
 ```
 
 ## BMM
@@ -130,6 +142,46 @@ python3 -m fp8_bench.bench_bmm \
   --warmup 5 --iters 20 --repeats 3
 ```
 
+Per-block BMM 同样注册了三种 B layout：
+
+```text
+triton_per_block_n
+triton_per_block_k
+triton_per_block_n_transpose
+```
+
+A scale 的逻辑 shape 为
+`[B,ceil(M/QBM),ceil(K/QBK)]`，B scale 为
+`[B,ceil(K/QBK),ceil(N/QBN)]`。默认 `QBM=QBK=QBN=128`：
+
+```bash
+python3 -m fp8_bench.bench_bmm \
+  --suite smoke \
+  --impl triton_per_block_n \
+  --impl triton_per_block_k \
+  --impl triton_per_block_n_transpose \
+  --mode both \
+  --warmup 5 --iters 20 --repeats 3
+```
+
+覆盖 quant block：
+
+```bash
+python3 -m fp8_bench.bench_bmm \
+  --suite legacy \
+  --case b32_m2048_n1600_k1600 \
+  --impl triton_per_block_n \
+  --quant-block-m 128 \
+  --quant-block-k 256 \
+  --quant-block-n 128 \
+  --mode perf
+```
+
+当前 quant kernel 要求 block size 为 2 的幂；当前 BMM config 还要求
+`QBK >= 128` 且能被 128 整除。M/N block 可以大于实际 M/N，尾块由 mask
+处理。`bmm-only`、`pipeline`、TFLOPS 和三种 layout 的计时口径与
+per-channel 相同。
+
 BMM 使用 `2 * B * M * N * K` 计算 FLOPs，终端和 JSONL 都会输出：
 
 ```text
@@ -162,6 +214,24 @@ ncu \
     --op quant \
     --case q_b32_m2048_k960 \
     --impl triton_per_tensor \
+    --warmup 5
+```
+
+Per-block quant：
+
+```bash
+ncu \
+  --set basic \
+  --kernel-name 'regex:.*fp8_per_block_quant_kernel.*' \
+  --launch-skip 5 \
+  --launch-count 1 \
+  -o reports/per_block_quant \
+  python3 -m fp8_bench.profile_one \
+    --op quant \
+    --case q_smoke_3d \
+    --impl triton_per_block \
+    --block-m 128 \
+    --block-n 128 \
     --warmup 5
 ```
 
@@ -200,6 +270,25 @@ ncu \
     --op bmm \
     --case bmm_smoke_aligned \
     --impl triton_per_channel_n \
+    --warmup 5
+```
+
+Per-block BMM：
+
+```bash
+ncu \
+  --set basic \
+  --kernel-name 'regex:.*batch_fp8_per_block_bmm_kernel.*' \
+  --launch-skip 5 \
+  --launch-count 1 \
+  -o reports/per_block_n \
+  python3 -m fp8_bench.profile_one \
+    --op bmm \
+    --case bmm_smoke_aligned \
+    --impl triton_per_block_n \
+    --quant-block-m 128 \
+    --quant-block-k 128 \
+    --quant-block-n 128 \
     --warmup 5
 ```
 

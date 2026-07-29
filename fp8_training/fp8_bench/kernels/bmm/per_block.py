@@ -44,7 +44,8 @@ def batch_fp8_per_block_bmm_kernel(
     QUANT_BLOCK_N: tl.constexpr,
     NUM_QUANT_BLOCK_K: tl.constexpr,
 ):
-    tl.static_assert(QUANT_BLOCK_K >= BLOCK_K and QUANT_BLOCK_K % BLOCK_K == 0)
+    tl.static_assert(QUANT_BLOCK_K >= BLOCK_K)
+    tl.static_assert(QUANT_BLOCK_K % BLOCK_K == 0)
 
     batch = tl.program_id(1)
     pid = tl.program_id(0)

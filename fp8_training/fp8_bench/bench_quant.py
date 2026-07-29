@@ -42,6 +42,18 @@ def main() -> None:
     parser.add_argument("--mode", choices=["perf", "accuracy", "both"], default="both")
     parser.add_argument("--input-dtype", default="fp32")
     parser.add_argument("--fp8-dtype", choices=["e4m3", "e5m2"], default="e4m3")
+    parser.add_argument(
+        "--block-m",
+        type=int,
+        default=128,
+        help="Override the row block size for per-block quantization.",
+    )
+    parser.add_argument(
+        "--block-n",
+        type=int,
+        default=128,
+        help="Override the column block size for per-block quantization.",
+    )
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--repeats", type=int, default=5)
@@ -60,6 +72,12 @@ def main() -> None:
         x = torch.randn(case.shape, device="cuda", dtype=input_dtype)
         for impl_name in impl_names:
             impl = get_quant(impl_name)
+            quant_kwargs = {}
+            if impl_name == "triton_per_block":
+                quant_kwargs = {
+                    "block_m": args.block_m,
+                    "block_n": args.block_n,
+                }
             values = {
                 "suite": args.suite,
                 "case": case.name,
@@ -67,12 +85,17 @@ def main() -> None:
                 "impl": impl_name,
                 "input_dtype": str(input_dtype),
                 "fp8_dtype": str(fp8_dtype),
+                "quant_kwargs": quant_kwargs,
                 "seed": args.seed,
             }
 
             if args.mode in {"perf", "both"}:
                 perf = benchmark_cuda(
-                    lambda: impl.fn(x, fp8_dtype=fp8_dtype),
+                    lambda: impl.fn(
+                        x,
+                        fp8_dtype=fp8_dtype,
+                        **quant_kwargs,
+                    ),
                     warmup=args.warmup,
                     iters=args.iters,
                     repeats=args.repeats,
@@ -88,7 +111,11 @@ def main() -> None:
                 )
 
             if args.mode in {"accuracy", "both"}:
-                result = impl.fn(x, fp8_dtype=fp8_dtype)
+                result = impl.fn(
+                    x,
+                    fp8_dtype=fp8_dtype,
+                    **quant_kwargs,
+                )
                 dequant = result.dequantize()
                 metrics = accuracy_metrics(dequant, x)
                 fp8_max = torch.finfo(fp8_dtype).max

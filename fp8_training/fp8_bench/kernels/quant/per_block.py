@@ -43,7 +43,7 @@ def fp8_per_block_quant_kernel(
     quant_scale = fp8_max / x_safe_amax
     dequant_scale = 1.0 / quant_scale
     tl.store(dequant_scale_ptr + pid_m * stride_sm + pid_n * stride_sn, dequant_scale)
-    y = x * quant_scale
+    y = tl.clamp(x * quant_scale, min=-fp8_max, max=fp8_max)
     y = y.to(y_ptr.dtype.element_ty)
     tl.store(y_ptr + offs_y, y, mask=mask)
         
