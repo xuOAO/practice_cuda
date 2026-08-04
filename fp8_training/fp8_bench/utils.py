@@ -156,11 +156,3 @@ def result_record(kind: str, **values: Any) -> dict[str, Any]:
         "environment": environment_info(),
         **values,
     }
-
-
-def print_perf(prefix: str, perf: dict[str, Any], extra: str = "") -> None:
-    print(
-        f"{prefix:<48} {perf['median_ms']:>9.4f} ms"
-        f"  p20={perf['p20_ms']:.4f} p80={perf['p80_ms']:.4f}"
-        f"{extra}"
-    )

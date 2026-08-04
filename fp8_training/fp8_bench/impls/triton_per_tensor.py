@@ -42,7 +42,11 @@ def triton_per_tensor_quant(
     fp8_max = torch.finfo(fp8_dtype).max
     quant_scale = fp8_max / max_abs
     dequant_scale = quant_scale.reciprocal()
-    output = torch.empty_like(x, dtype=fp8_dtype)
+    output = torch.empty_like(
+        x,
+        dtype=fp8_dtype,
+        memory_format=torch.preserve_format,
+    )
 
     if x.ndim == 2:
         batch = 1
@@ -91,18 +95,24 @@ def triton_per_tensor_quant(
     )
 
 
+def prepare_a_layout(value: QuantResult, layout: str) -> QuantResult:
+    if layout not in {"k", "m"}:
+        raise ValueError(f"unknown A layout: {layout}")
+    actual = _a_layout(value.tensor)
+    expected = f"{layout}-major"
+    if actual != expected:
+        raise ValueError(f"expected {expected} A, got {actual}")
+    return value
+
+
 def prepare_b_layout(value: QuantResult, layout: str) -> QuantResult:
-    if layout == "n":
-        return value
-    if layout != "k":
+    if layout not in {"n", "k"}:
         raise ValueError(f"unknown B layout: {layout}")
-    return QuantResult(
-        tensor=value.tensor.transpose(-1, -2).contiguous().transpose(-1, -2),
-        dequant_scale=value.dequant_scale,
-        impl=value.impl,
-        granularity=value.granularity,
-        meta={**value.meta, "layout": "k"},
-    )
+    actual = _b_layout(value.tensor)
+    expected = f"{layout}-major"
+    if actual != expected:
+        raise ValueError(f"expected {expected} B, got {actual}")
+    return value
 
 
 def _b_layout(tensor: torch.Tensor) -> str:
@@ -116,6 +126,17 @@ def _b_layout(tensor: torch.Tensor) -> str:
     )
 
 
+def _a_layout(tensor: torch.Tensor) -> str:
+    if tensor.stride(-1) == 1:
+        return "k-major"
+    if tensor.stride(-2) == 1:
+        return "m-major"
+    raise ValueError(
+        "A must be contiguous along either K or M; "
+        f"shape={tuple(tensor.shape)}, strides={tensor.stride()}"
+    )
+
+
 def triton_per_tensor_bmm(
     a: QuantResult,
     b: QuantResult,
@@ -123,20 +144,32 @@ def triton_per_tensor_bmm(
     out_dtype: torch.dtype = torch.bfloat16,
     bias: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    do_transpose_a: bool = False,
     do_transpose_b: bool = False,
     dequant_scale: Optional[torch.Tensor] = None,
     profile: bool = False,
     use_tma: bool = False,
+    activation: str = "none",
 ) -> torch.Tensor:
     if a.tensor.ndim != 3 or b.tensor.ndim != 3:
         raise ValueError("BMM expects 3D quantized tensors")
 
-    a_tensor = a.tensor
-    if a_tensor.stride(-1) != 1:
+    if activation not in ("none", "gelu"):
         raise ValueError(
-            "A must be contiguous along K; "
-            f"shape={tuple(a_tensor.shape)}, strides={a_tensor.stride()}"
+            f"activation must be 'none' or 'gelu', got {activation!r}"
         )
+
+    input_a_layout = _a_layout(a.tensor)
+    if do_transpose_a:
+        if input_a_layout != "m-major":
+            raise ValueError(
+                "do_transpose_a=True requires an M-major A input; "
+                f"strides={a.tensor.stride()}"
+            )
+        a_tensor = a.tensor.contiguous()
+    else:
+        a_tensor = a.tensor
+    a_k_major = _a_layout(a_tensor) == "k-major"
 
     input_b_layout = _b_layout(b.tensor)
     if do_transpose_b:
@@ -258,18 +291,35 @@ def triton_per_tensor_bmm(
         stride_biasm,
         stride_biasn,
         USE_BIAS=bias is not None,
+        A_K_MAJOR=a_k_major,
         B_N_MAJOR=b_n_major,
+        ACTIVATION=activation,
         **launch_kwargs,
     )
     return out
+
+
+def _quant_best_config():
+    return getattr(fp8_per_tensor_quant_kernel_autotuned, "best_config", None)
+
+
+def _bmm_best_config(use_tma: bool):
+    kernel = (
+        batch_fp8_per_tensor_bmm_tma_kernel_autotuned
+        if use_tma
+        else batch_fp8_per_tensor_bmm_kernel_autotuned
+    )
+    return getattr(kernel, "best_config", None)
+
 
 register_quant(
     "triton_per_tensor",
     triton_per_tensor_quant,
     "Migrated per-tensor scale quantization; supports E4M3 and E5M2.",
+    get_best_config=_quant_best_config,
 )
 register_bmm(
-    "triton_per_tensor_n",
+    "triton_per_tensor_a_k_b_n",
     partial(triton_per_tensor_bmm, do_transpose_b=False),
     quant_impl="triton_per_tensor",
     layout="n",
@@ -278,9 +328,10 @@ register_bmm(
         "dequant_scale": a.dequant_scale * b.dequant_scale
     },
     description="Migrated FP8 BMM with contiguous [B,K,N] right operand.",
+    get_best_config=_bmm_best_config,
 )
 register_bmm(
-    "triton_per_tensor_k",
+    "triton_per_tensor_a_k_b_k",
     partial(triton_per_tensor_bmm, do_transpose_b=False),
     quant_impl="triton_per_tensor",
     layout="k",
@@ -289,9 +340,10 @@ register_bmm(
         "dequant_scale": a.dequant_scale * b.dequant_scale
     },
     description="FP8 BMM with a prepacked K-major [B,K,N] right operand.",
+    get_best_config=_bmm_best_config,
 )
 register_bmm(
-    "triton_per_tensor_n_transpose",
+    "triton_per_tensor_a_k_b_n_transpose",
     partial(triton_per_tensor_bmm, do_transpose_b=True),
     quant_impl="triton_per_tensor",
     layout="n",
@@ -300,4 +352,41 @@ register_bmm(
         "dequant_scale": a.dequant_scale * b.dequant_scale
     },
     description="N-major FP8 BMM with explicit N-to-K packing inside the call.",
+    get_best_config=_bmm_best_config,
+)
+register_bmm(
+    "triton_per_tensor_a_m_b_n",
+    partial(
+        triton_per_tensor_bmm,
+        do_transpose_a=False,
+        do_transpose_b=False,
+    ),
+    quant_impl="triton_per_tensor",
+    a_layout="m",
+    layout="n",
+    prepare_a=lambda value: prepare_a_layout(value, "m"),
+    prepare_b=lambda value: prepare_b_layout(value, "n"),
+    prepare_call_kwargs=lambda a, b: {
+        "dequant_scale": a.dequant_scale * b.dequant_scale
+    },
+    description="FP8 BMM with direct M-major A and N-major B operands.",
+    get_best_config=_bmm_best_config,
+)
+register_bmm(
+    "triton_per_tensor_a_m_transpose_b_n_transpose",
+    partial(
+        triton_per_tensor_bmm,
+        do_transpose_a=True,
+        do_transpose_b=True,
+    ),
+    quant_impl="triton_per_tensor",
+    a_layout="m",
+    layout="n",
+    prepare_a=lambda value: prepare_a_layout(value, "m"),
+    prepare_b=lambda value: prepare_b_layout(value, "n"),
+    prepare_call_kwargs=lambda a, b: {
+        "dequant_scale": a.dequant_scale * b.dequant_scale
+    },
+    description="M-major A and N-major B with both operands packed inside the BMM call.",
+    get_best_config=_bmm_best_config,
 )

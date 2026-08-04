@@ -1,5 +1,38 @@
-__pycache__/
-*.py[cod]
-results/
-reports/
-*.ncu-rep
+# Ignore every untracked non-source file under fp8_training by default.
+*
+!*/
+
+# Source code
+!*.py
+!*.pyi
+!*.c
+!*.cc
+!*.cpp
+!*.cuh
+!*.cu
+!*.h
+!*.hpp
+!*.sh
+!*.bash
+
+# Project configuration needed to build and run the source
+!*.toml
+!*.yaml
+!*.yml
+!*.cfg
+!*.ini
+!Makefile
+!CMakeLists.txt
+!/.gitignore
+!/README.md
+!/requirements.txt
+
+# Local dependencies and generated output are never repository content.
+/reference/
+/results/
+/reports/
+/artifacts/
+/profiles/
+/logs/
+/torch_compile_debug/
+/fp8_bench/modules/traces/

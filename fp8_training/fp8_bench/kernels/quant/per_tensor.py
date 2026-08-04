@@ -52,5 +52,5 @@ _CONFIGS = [
 
 fp8_per_tensor_quant_kernel_autotuned = triton.autotune(
     configs=_CONFIGS,
-    key=["m", "n"],
+    key=["m", "n", "stride_xn", "stride_yn"],
 )(fp8_per_tensor_quant_kernel)

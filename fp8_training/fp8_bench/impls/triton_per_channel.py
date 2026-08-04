@@ -15,6 +15,8 @@ from fp8_bench.kernels.bmm.per_channel import (
 from fp8_bench.kernels.quant.per_channel import (
     fp8_per_channel_quant_kernel,
     fp8_per_channel_quant_kernel_autotuned,
+    fp8_per_channel_quant_one_pass_kernel,
+    fp8_per_channel_quant_torch_compile,
 )
 from fp8_bench.registry import (
     QuantResult,
@@ -38,6 +40,53 @@ def _matrix_layout(tensor: torch.Tensor, name: str) -> str:
     )
 
 
+def _a_layout(tensor: torch.Tensor) -> str:
+    if tensor.stride(-1) == 1:
+        return "k-major"
+    if tensor.stride(-2) == 1:
+        return "m-major"
+    raise ValueError(
+        "A must be contiguous along either K or M; "
+        f"shape={tuple(tensor.shape)}, strides={tensor.stride()}"
+    )
+
+
+def torch_compile_per_channel_quant(
+    x: torch.Tensor,
+    *,
+    channel_axis: int = -1,
+    fp8_dtype: torch.dtype = torch.float8_e4m3fn,
+    eps: float = 1e-12,
+    profile: bool = False,
+) -> QuantResult:
+    del profile
+    if x.ndim not in {2, 3}:
+        raise ValueError(
+            f"per-channel quant expects a 2D or 3D tensor, got {tuple(x.shape)}"
+        )
+    if channel_axis not in {-1, -2}:
+        raise ValueError(f"channel_axis must be -1 or -2, got {channel_axis}")
+
+    output, dequant_scale = fp8_per_channel_quant_torch_compile(
+        x,
+        channel_axis,
+        fp8_dtype,
+        eps,
+    )
+    return QuantResult(
+        tensor=output,
+        dequant_scale=dequant_scale,
+        impl="torch_compile_per_channel",
+        granularity="channel",
+        meta={
+            "logical_shape": tuple(x.shape),
+            "fp8_dtype": str(fp8_dtype),
+            "channel_axis": channel_axis,
+            "quant_strategy": "torch_compile",
+        },
+    )
+
+
 def triton_per_channel_quant(
     x: torch.Tensor,
     *,
@@ -45,6 +94,7 @@ def triton_per_channel_quant(
     fp8_dtype: torch.dtype = torch.float8_e4m3fn,
     eps: float = 1e-12,
     profile: bool = False,
+    one_pass: bool = False,
 ) -> QuantResult:
     if x.ndim not in {2, 3}:
         raise ValueError(
@@ -54,7 +104,12 @@ def triton_per_channel_quant(
         raise ValueError(f"channel_axis must be -1 or -2, got {channel_axis}")
 
     x_n_major = _matrix_layout(x, "quant input") == "n-major"
-    output = torch.empty(x.shape, device=x.device, dtype=fp8_dtype)
+    output = torch.empty_like(
+        x,
+        dtype=fp8_dtype,
+        memory_format=torch.preserve_format,
+    )
+    output_n_major = _matrix_layout(output, "quant output") == "n-major"
     if x.ndim == 2:
         batch = 1
         m, n = x.shape
@@ -65,80 +120,123 @@ def triton_per_channel_quant(
         stride_yb = output.stride(0)
 
     channel_size = m if channel_axis == -2 else n
+    reduction_size = n if channel_axis == -2 else m
     scale_storage = torch.empty(
         (batch, channel_size),
         device=x.device,
         dtype=torch.float32,
     )
-    grid = lambda meta: (
-        triton.cdiv(
-            m if channel_axis == -2 else n,
-            meta["BLOCK_M"] if channel_axis == -2 else meta["BLOCK_N"],
-        ),
-        batch,
-    )
-
-    kernel = (
-        fp8_per_channel_quant_kernel
-        if profile
-        else fp8_per_channel_quant_kernel_autotuned
-    )
-    launch_kwargs = {}
-    if profile:
-        launch_kwargs = {
-            "BLOCK_M": 64,
-            "BLOCK_N": 128,
-            "num_warps": 4,
-            "num_stages": 3,
-        }
-    kernel[grid](
-        x,
-        output,
-        m,
-        n,
-        stride_xb,
-        x.stride(-2),
-        x.stride(-1),
-        stride_yb,
-        output.stride(-2),
-        output.stride(-1),
-        scale_storage,
-        scale_storage.stride(0),
-        scale_storage.stride(1),
-        channel_axis=channel_axis,
-        X_N_MAJOR=x_n_major,
-        Y_N_MAJOR=True,
-        fp8_max=torch.finfo(fp8_dtype).max,
-        dim=x.ndim,
-        EPS=eps,
-        **launch_kwargs,
-    )
+    if one_pass:
+        if reduction_size == 0:
+            raise ValueError("one-pass per-channel quant requires a non-empty reduction")
+        if reduction_size > 4096:
+            raise ValueError(
+                "one-pass per-channel quant supports reduction sizes up to 4096, "
+                f"got {reduction_size}"
+            )
+        block_size = triton.next_power_of_2(reduction_size)
+        num_warps = 8 if block_size >= 2048 else 4
+        fp8_per_channel_quant_one_pass_kernel[(channel_size, batch)](
+            x,
+            output,
+            m,
+            n,
+            stride_xb,
+            x.stride(-2),
+            x.stride(-1),
+            stride_yb,
+            output.stride(-2),
+            output.stride(-1),
+            scale_storage,
+            scale_storage.stride(0),
+            scale_storage.stride(1),
+            channel_axis=channel_axis,
+            fp8_max=torch.finfo(fp8_dtype).max,
+            dim=x.ndim,
+            BLOCK_SIZE=block_size,
+            EPS=eps,
+            num_warps=num_warps,
+        )
+    else:
+        grid = lambda meta: (
+            triton.cdiv(
+                channel_size,
+                meta["BLOCK_M"] if channel_axis == -2 else meta["BLOCK_N"],
+            ),
+            batch,
+        )
+        kernel = (
+            fp8_per_channel_quant_kernel
+            if profile
+            else fp8_per_channel_quant_kernel_autotuned
+        )
+        launch_kwargs = {}
+        if profile:
+            launch_kwargs = {
+                "BLOCK_M": 64,
+                "BLOCK_N": 128,
+                "num_warps": 4,
+                "num_stages": 3,
+            }
+        kernel[grid](
+            x,
+            output,
+            m,
+            n,
+            stride_xb,
+            x.stride(-2),
+            x.stride(-1),
+            stride_yb,
+            output.stride(-2),
+            output.stride(-1),
+            scale_storage,
+            scale_storage.stride(0),
+            scale_storage.stride(1),
+            channel_axis=channel_axis,
+            X_N_MAJOR=x_n_major,
+            Y_N_MAJOR=output_n_major,
+            fp8_max=torch.finfo(fp8_dtype).max,
+            dim=x.ndim,
+            EPS=eps,
+            **launch_kwargs,
+        )
     dequant_scale = scale_storage.squeeze(0) if x.ndim == 2 else scale_storage
     return QuantResult(
         tensor=output,
         dequant_scale=dequant_scale,
-        impl="triton_per_channel",
+        impl=(
+            "triton_per_channel_one_pass"
+            if one_pass
+            else "triton_per_channel"
+        ),
         granularity="channel",
         meta={
             "logical_shape": tuple(x.shape),
             "fp8_dtype": str(fp8_dtype),
             "channel_axis": channel_axis,
+            "quant_strategy": "one_pass" if one_pass else "two_pass",
         },
     )
 
 
+def prepare_a_layout(value: QuantResult, layout: str) -> QuantResult:
+    if layout not in {"k", "m"}:
+        raise ValueError(f"unknown A layout: {layout}")
+    actual = _a_layout(value.tensor)
+    expected = f"{layout}-major"
+    if actual != expected:
+        raise ValueError(f"expected {expected} A, got {actual}")
+    return value
+
+
 def prepare_b_layout(value: QuantResult, layout: str) -> QuantResult:
-    if layout == "n":
-        return value
-    if layout != "k":
+    if layout not in {"n", "k"}:
         raise ValueError(f"unknown B layout: {layout}")
-    return QuantResult(
-        tensor=value.tensor.transpose(-1, -2).contiguous().transpose(-1, -2),
-        dequant_scale=value.dequant_scale,
-        impl=value.impl,
-        granularity=value.granularity,
-        meta={**value.meta, "layout": "k"},
-    )
+    actual = _matrix_layout(value.tensor, "B")
+    expected = f"{layout}-major"
+    if actual != expected:
+        raise ValueError(f"expected {expected} B, got {actual}")
+    return value
 
 
 def _validate_scale(
@@ -177,19 +275,31 @@ def triton_per_channel_bmm(
     out_dtype: torch.dtype = torch.bfloat16,
     bias: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    do_transpose_a: bool = False,
     do_transpose_b: bool = False,
     profile: bool = False,
     use_tma: bool = False,
+    activation: str = "none",
 ) -> torch.Tensor:
     if a.tensor.ndim != 3 or b.tensor.ndim != 3:
         raise ValueError("BMM expects 3D quantized tensors")
 
-    a_tensor = a.tensor
-    if a_tensor.stride(-1) != 1:
+    if activation not in ("none", "gelu"):
         raise ValueError(
-            "A must be contiguous along K; "
-            f"shape={tuple(a_tensor.shape)}, strides={a_tensor.stride()}"
+            f"activation must be 'none' or 'gelu', got {activation!r}"
         )
+
+    input_a_layout = _a_layout(a.tensor)
+    if do_transpose_a:
+        if input_a_layout != "m-major":
+            raise ValueError(
+                "do_transpose_a=True requires an M-major A input; "
+                f"strides={a.tensor.stride()}"
+            )
+        a_tensor = a.tensor.contiguous()
+    else:
+        a_tensor = a.tensor
+    a_k_major = _a_layout(a_tensor) == "k-major"
 
     input_b_layout = _matrix_layout(b.tensor, "B")
     if do_transpose_b:
@@ -308,19 +418,45 @@ def triton_per_channel_bmm(
         *a.dequant_scale.stride(),
         *b.dequant_scale.stride(),
         USE_BIAS=bias is not None,
+        A_K_MAJOR=a_k_major,
         B_N_MAJOR=b_n_major,
+        ACTIVATION=activation,
         **launch_kwargs,
     )
     return out
 
 
+def _quant_best_config():
+    return getattr(fp8_per_channel_quant_kernel_autotuned, "best_config", None)
+
+
+def _bmm_best_config(use_tma: bool):
+    kernel = (
+        batch_fp8_per_channel_bmm_tma_kernel_autotuned
+        if use_tma
+        else batch_fp8_per_channel_bmm_kernel_autotuned
+    )
+    return getattr(kernel, "best_config", None)
+
+
+register_quant(
+    "torch_compile_per_channel",
+    torch_compile_per_channel_quant,
+    "torch.compile per-channel scale quantization; supports E4M3 and E5M2.",
+)
+register_quant(
+    "triton_per_channel_one_pass",
+    partial(triton_per_channel_quant, one_pass=True),
+    "One-pass Triton per-channel quantization for reductions up to 4096.",
+)
 register_quant(
     "triton_per_channel",
     triton_per_channel_quant,
     "Per-channel scale quantization; supports E4M3 and E5M2.",
+    get_best_config=_quant_best_config,
 )
 register_bmm(
-    "triton_per_channel_n",
+    "triton_per_channel_a_k_b_n",
     partial(triton_per_channel_bmm, do_transpose_b=False),
     quant_impl="triton_per_channel",
     quant_a_kwargs={"channel_axis": -2},
@@ -328,9 +464,10 @@ register_bmm(
     layout="n",
     prepare_b=lambda value: prepare_b_layout(value, "n"),
     description="Per-channel FP8 BMM with an N-major [B,K,N] right operand.",
+    get_best_config=_bmm_best_config,
 )
 register_bmm(
-    "triton_per_channel_k",
+    "triton_per_channel_a_k_b_k",
     partial(triton_per_channel_bmm, do_transpose_b=False),
     quant_impl="triton_per_channel",
     quant_a_kwargs={"channel_axis": -2},
@@ -338,9 +475,10 @@ register_bmm(
     layout="k",
     prepare_b=lambda value: prepare_b_layout(value, "k"),
     description="Per-channel FP8 BMM with a prepacked K-major right operand.",
+    get_best_config=_bmm_best_config,
 )
 register_bmm(
-    "triton_per_channel_n_transpose",
+    "triton_per_channel_a_k_b_n_transpose",
     partial(triton_per_channel_bmm, do_transpose_b=True),
     quant_impl="triton_per_channel",
     quant_a_kwargs={"channel_axis": -2},
@@ -348,4 +486,39 @@ register_bmm(
     layout="n",
     prepare_b=lambda value: prepare_b_layout(value, "n"),
     description="N-major per-channel FP8 BMM with packing inside the call.",
+    get_best_config=_bmm_best_config,
+)
+register_bmm(
+    "triton_per_channel_a_m_b_n",
+    partial(
+        triton_per_channel_bmm,
+        do_transpose_a=False,
+        do_transpose_b=False,
+    ),
+    quant_impl="triton_per_channel",
+    quant_a_kwargs={"channel_axis": -2},
+    quant_b_kwargs={"channel_axis": -1},
+    a_layout="m",
+    layout="n",
+    prepare_a=lambda value: prepare_a_layout(value, "m"),
+    prepare_b=lambda value: prepare_b_layout(value, "n"),
+    description="Per-channel FP8 BMM with direct M-major A and N-major B operands.",
+    get_best_config=_bmm_best_config,
+)
+register_bmm(
+    "triton_per_channel_a_m_transpose_b_n_transpose",
+    partial(
+        triton_per_channel_bmm,
+        do_transpose_a=True,
+        do_transpose_b=True,
+    ),
+    quant_impl="triton_per_channel",
+    quant_a_kwargs={"channel_axis": -2},
+    quant_b_kwargs={"channel_axis": -1},
+    a_layout="m",
+    layout="n",
+    prepare_a=lambda value: prepare_a_layout(value, "m"),
+    prepare_b=lambda value: prepare_b_layout(value, "n"),
+    description="M-major A and N-major B with both operands packed inside the BMM call.",
+    get_best_config=_bmm_best_config,
 )

@@ -10,6 +10,7 @@ import torch.distributed as dist
 import torch.nn.functional as functional
 from torch import nn
 
+from fp8_bench.reporting import print_progress, print_records
 from fp8_bench.utils import append_jsonl, environment_info, seed_everything
 
 
@@ -205,13 +206,13 @@ def main() -> None:
             "all_step_ms_rank0": elapsed_ms,
         }
         append_jsonl(args.results, record)
-        print(
-            f"FSDP2 {args.impl}: {median_ms:.3f} ms/step,"
-            f" {samples_per_second:.2f} samples/s,"
-            f" est_gemm={estimated_gemm_tflops:.2f} TFLOPS,"
-            f" peak={peak_memory.item() / 1024**3:.2f} GiB,"
-            f" loss={losses[0]:.6g}->{losses[-1]:.6g}"
+        print_progress(
+            1,
+            1,
+            f"{args.impl} world_size={world_size}",
+            performance=f"duration={median_ms:.4f} ms",
         )
+        print_records([record], title="FSDP2 summary")
 
     dist.destroy_process_group()
 

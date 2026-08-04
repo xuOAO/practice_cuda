@@ -4,9 +4,10 @@
 
 - per-tensor scaling Triton quant，支持 E4M3 / E5M2；
 - per-channel scaling Triton quant，BMM 中 A 按 M 维、B 按 N 维量化；
-- per-block scaling Triton quant/BMM，默认 quant block 为 `128×128×128`；
-- FP8 BMM，右矩阵逻辑 shape 固定为 `[B,K,N]`，支持 N-major、
-  预先 K-major 和 N-major 显式重排三条路径；
+- per-block scaling Triton quant/BMM，区分沿 K 的 1D `1×128` block 和
+  `128×128` 的 2D block；
+- FP8 BMM，A/B 的逻辑 shape 分别固定为 `[B,M,K]` / `[B,K,N]`，
+  支持常见的直接布局和显式重排共五条路径；
 - 旧 benchmark 的 quant/BMM shapes；
 - FSDP2 BF16 baseline 和一个用于验证训练链路的 fake-FP8 case。
 
@@ -22,7 +23,8 @@ cd /path/to/practice_cuda/fp8_training
 python3 -m fp8_bench.doctor
 ```
 
-依赖由远端环境提供，只要求能正常 import `torch` 和 `triton`。FP8 BMM
+依赖由远端环境提供，要求能正常 import `torch`、`triton` 和 `pandas`；
+缺少 pandas 时可以运行 `python3 -m pip install -r requirements.txt`。FP8 BMM
 需要支持 FP8 Tensor Core 的 GPU。NCU profiling 还需要 `ncu` 在 `PATH` 中。
 
 ## Quant
@@ -55,16 +57,18 @@ python3 -m fp8_bench.bench_quant \
   --impl triton_per_tensor
 ```
 
-Per-block quant 默认使用 `128×128`，也可以覆盖 block shape：
+Per-block quant 分为默认 `1×128` 的 1D block 和默认 `128×128` 的 2D block，
+也可以覆盖 block shape：
 
 ```bash
 python3 -m fp8_bench.bench_quant \
   --suite smoke \
-  --impl triton_per_block \
-  --block-m 128 \
-  --block-n 128 \
+  --impl triton_per_block_1d \
+  --impl triton_per_block_2d \
   --mode both
 ```
+
+需要实验其他 block shape 时仍可用 `--block-m` 和 `--block-n` 覆盖默认值。
 
 ## BMM
 
@@ -73,9 +77,9 @@ python3 -m fp8_bench.bench_quant \
 ```bash
 python3 -m fp8_bench.bench_bmm \
   --suite smoke \
-  --impl triton_per_tensor_n \
-  --impl triton_per_tensor_k \
-  --impl triton_per_tensor_n_transpose \
+  --impl triton_per_tensor_a_k_b_n \
+  --impl triton_per_tensor_a_k_b_k \
+  --impl triton_per_tensor_a_k_b_n_transpose \
   --mode both
 ```
 
@@ -84,12 +88,49 @@ python3 -m fp8_bench.bench_bmm \
 ```bash
 python3 -m fp8_bench.bench_bmm \
   --suite legacy \
-  --impl triton_per_tensor_n \
-  --impl triton_per_tensor_k \
-  --impl triton_per_tensor_n_transpose \
+  --impl triton_per_tensor_a_k_b_n \
+  --impl triton_per_tensor_a_k_b_k \
+  --impl triton_per_tensor_a_k_b_n_transpose \
   --mode perf \
   --warmup 20 --iters 100 --repeats 5
 ```
+
+全量 shape、全部实现，只计时预量化后的 BMM，并在同一次运行中比较
+block-pointer 和 TMA kernel：
+
+```bash
+python3 -m fp8_bench.bench_bmm \
+  --suite legacy \
+  --mode perf \
+  --perf-scope bmm \
+  --backend both \
+  --warmup 20 --iters 100 --repeats 5
+```
+
+`--backend` 可选 `block-ptr`、`tma` 或 `both`，默认是 `block-ptr`；
+原有 `--use-tma` 等价于 `--backend tma`。TMA 要求相关 FP8
+维度满足 16-byte 对齐，内置 legacy shapes 均满足。
+
+同一批 shape 同时测纯 FP16 `torch.bmm` baseline、FP8 BMM-only 和
+quant+FP8 BMM pipeline：
+
+```bash
+python3 -m fp8_bench.bench_bmm \
+  --suite legacy \
+  --impl triton_per_channel_a_k_b_n \
+  --impl triton_per_block_1d_a_k_b_n \
+  --impl triton_per_block_2d_a_k_b_n \
+  --mode perf \
+  --perf-scope both \
+  --backend both \
+  --fp16-baseline \
+  --results results/bmm_with_fp16_baseline.jsonl
+```
+
+FP16 baseline 每个 case 测三种布局：`fp16_a_k_b_k`、
+`fp16_a_k_b_n` 和 `fp16_a_m_b_n`。输入转换、布局准备和输出分配
+不计时；JSONL 中使用对应的 `impl` 名称，并记为 `backend=torch`。
+使用 `--bias` 时对应调用 FP16 `torch.baddbmm`。
 
 指定 shape、输出类型和 bias：
 
@@ -97,69 +138,91 @@ python3 -m fp8_bench.bench_bmm \
 python3 -m fp8_bench.bench_bmm \
   --suite legacy \
   --case b16_m512_n960_k1280 \
-  --impl triton_per_tensor_n \
+  --impl triton_per_tensor_a_k_b_n \
   --input-dtype bf16 \
   --out-dtype bf16 \
   --fp8-dtype e4m3 \
   --bias
 ```
 
-三个实现共用同一个 `triton_per_tensor_bmm` 和 Triton kernel：
+布局名约定如下：A 的逻辑 shape 为 `[B,M,K]`，`a_k` 表示 K 维连续，
+`a_m` 表示 M 维连续；B 的逻辑 shape 为 `[B,K,N]`，`b_n` 表示 N 维
+连续，`b_k` 表示 K 维连续。每种 scaling 都注册下面五条路径；
+per-tensor 的具体名字是：
 
 ```text
-triton_per_tensor_n             N-major B，直接进入 Triton BMM
-triton_per_tensor_k             BMM 计时前预先准备成 K-major
-triton_per_tensor_n_transpose   N-major B，在 BMM wrapper 内显式重排成 K-major
+triton_per_tensor_a_k_b_k                                  a_k_b_k
+triton_per_tensor_a_k_b_n                                  a_k_b_n
+triton_per_tensor_a_k_b_n_transpose                        a_k_b_n_transpose
+triton_per_tensor_a_m_b_n                            a_m_b_n
+triton_per_tensor_a_m_transpose_b_n_transpose        a_m_transpose_b_n_transpose
 ```
 
-三者的 B 逻辑 shape 始终是 `[B,K,N]`，N-major/K-major 只由 stride 区分。
-`triton_per_tensor_n_transpose` 的 `bmm-only` 包含显式 N→K 重排，另外两种
-`bmm-only` 不包含 quant 或 layout 准备；per-tensor dequant scale 会在
-计时前合并。`pipeline` 则包含 A/B quant、必要的 layout 转换、scale 合并
-和 BMM。
+所有路径的逻辑 shape 不变，layout 只由 stride 区分。
+`triton_per_tensor_a_k_b_n_transpose` 的 `bmm-only` 包含显式 N→K 重排；直接布局
+路径的 `bmm-only` 不包含 quant 或 layout 准备，per-tensor dequant scale
+会在计时前合并。`a_m_transpose_b_n_transpose` 的 `bmm-only` 包含 A 和 B
+两次显式重排。benchmark 会在计时前把 BF16 输入 materialize 成路径要求的
+stride，quant 保持输入布局；因此直接布局的 `pipeline` 只包含 A/B quant、
+scale 合并和 BMM。名字中显式带 `transpose` 的路径仍会计入其内部重排。
+当前没有注册只重排 a_m 输入中一个 operand 的组合。
+
+对应标准 linear `Y = X @ W.T`（X、W 和 dY 均按 PyTorch 默认连续存储）：
+
+```text
+forward: a_k_b_k
+dX:      a_k_b_n
+dW:      a_m_b_n
+```
 
 精度输出中，`kernel_rel_l2` 对比相同 FP8 输入的 FP32 累加 reference，
 `pipeline_rel_l2` 对比原始输入的 FP32 BMM。
 
-Per-channel BMM 使用同样的三种路径：
+Per-channel BMM 使用同样的五种路径：
 
 ```text
-triton_per_channel_n
-triton_per_channel_k
-triton_per_channel_n_transpose
+triton_per_channel_a_k_b_k
+triton_per_channel_a_k_b_n
+triton_per_channel_a_k_b_n_transpose
+triton_per_channel_a_m_b_n
+triton_per_channel_a_m_transpose_b_n_transpose
 ```
 
 其中 A 的 dequant scale shape 为 `[B,M]`，B 为 `[B,N]`，两者在 BMM
-kernel 中广播相乘。快速验证三条路径：
+kernel 中广播相乘。快速验证五条路径：
 
 ```bash
 python3 -m fp8_bench.bench_bmm \
   --suite smoke \
-  --impl triton_per_channel_n \
-  --impl triton_per_channel_k \
-  --impl triton_per_channel_n_transpose \
+  --impl triton_per_channel_a_k_b_n \
+  --impl triton_per_channel_a_k_b_k \
+  --impl triton_per_channel_a_k_b_n_transpose \
+  --impl triton_per_channel_a_m_b_n \
+  --impl triton_per_channel_a_m_transpose_b_n_transpose \
   --mode both \
   --warmup 5 --iters 20 --repeats 3
 ```
 
-Per-block BMM 同样注册了三种 B layout：
+Per-block BMM 的 1D/2D scaling 各自注册了五种路径：
 
 ```text
-triton_per_block_n
-triton_per_block_k
-triton_per_block_n_transpose
+triton_per_block_{1d,2d}_a_k_b_k
+triton_per_block_{1d,2d}_a_k_b_n
+triton_per_block_{1d,2d}_a_k_b_n_transpose
+triton_per_block_{1d,2d}_a_m_b_n
+triton_per_block_{1d,2d}_a_m_transpose_b_n_transpose
 ```
 
 A scale 的逻辑 shape 为
 `[B,ceil(M/QBM),ceil(K/QBK)]`，B scale 为
-`[B,ceil(K/QBK),ceil(N/QBN)]`。默认 `QBM=QBK=QBN=128`：
+`[B,ceil(K/QBK),ceil(N/QBN)]`。1D 沿 K 分组，默认
+`(QBM,QBK,QBN)=(1,128,1)`；2D 默认 `(128,128,128)`：
 
 ```bash
 python3 -m fp8_bench.bench_bmm \
   --suite smoke \
-  --impl triton_per_block_n \
-  --impl triton_per_block_k \
-  --impl triton_per_block_n_transpose \
+  --impl triton_per_block_1d_a_k_b_n \
+  --impl triton_per_block_2d_a_k_b_n \
   --mode both \
   --warmup 5 --iters 20 --repeats 3
 ```
@@ -170,7 +233,7 @@ python3 -m fp8_bench.bench_bmm \
 python3 -m fp8_bench.bench_bmm \
   --suite legacy \
   --case b32_m2048_n1600_k1600 \
-  --impl triton_per_block_n \
+  --impl triton_per_block_2d_a_k_b_n \
   --quant-block-m 128 \
   --quant-block-k 256 \
   --quant-block-n 128 \
@@ -179,14 +242,14 @@ python3 -m fp8_bench.bench_bmm \
 
 当前 quant kernel 要求 block size 为 2 的幂；当前 BMM config 还要求
 `QBK >= 128` 且能被 128 整除。M/N block 可以大于实际 M/N，尾块由 mask
-处理。`bmm-only`、`pipeline`、TFLOPS 和三种 layout 的计时口径与
+处理。`bmm-only`、`pipeline`、TFLOPS 和五种 layout 的计时口径与
 per-channel 相同。
 
 BMM 使用 `2 * B * M * N * K` 计算 FLOPs，终端和 JSONL 都会输出：
 
 ```text
 bmm_tflops       # 只计算预量化后的 BMM kernel
-pipeline_tflops  # quant A + quant B + layout + BMM 的等效吞吐
+pipeline_tflops  # quant A + quant B + BMM 的等效吞吐；显式 transpose 路径含重排
 ```
 
 Quant 没有适合的 TFLOPS 定义，因此单独使用读写有效带宽 `bandwidth_gbps`。
@@ -203,26 +266,57 @@ Quant 和 BMM 精度结果统一包含 `mean_abs`、`max_abs`、`mse`、`rmse`�
 1. 根据所选 suite 的最大 M/N/K 和命令行上限生成 2 的幂搜索空间；
 2. 编译并加载每个 cubin，过滤编译失败、spill/local memory、资源超限、
    occupancy 为零以及没有生成 WGMMA/HGMMA 的配置；
-3. 用 tile/wave efficiency 粗排，短测候选，再对前几名做正式复测；
-4. 写出完整 JSONL 和每个 shape 的最佳配置 JSON。
+3. 短测所有通过编译筛选的配置，再对耗时前几名做正式复测；
+4. 写出完整 JSONL 和每个 shape 的最佳配置 JSON，并在终端格式化打印
+   每个 impl 的 per-case 最佳配置和可直接贴回 `_CONFIGS` 的
+   `triton.Config(...)` 列表。
 
 例如搜索 per-tensor N-major：
 
 ```bash
 python3 -m fp8_bench.tuning.search_bmm \
   --suite legacy \
-  --impl triton_per_tensor_n \
+  --impl triton_per_tensor_a_k_b_n \
   --block-m-cap 256 \
   --block-n-cap 256 \
   --block-k-cap 256
 ```
 
-搜索 per-channel K-major：
+`--impl` 可重复传值，一次跑出多种实现的最佳配置；每个实现分别写入
+`results/tuning/<impl>_<suite>.jsonl` 及配套的 `.best.json`，避免把不同
+layout 混入同一结果文件。TMA 变体以
+`*_tma` 结尾（如 `triton_per_tensor_a_k_b_n_tma`），它要求 fp8 的 K（以及
+N-major B 的 N）为 16 的倍数，否则该 shape 会被跳过并记为
+`case_failed`。一条命令同时搜 block_ptr 与 TMA 两种 per-tensor kernel：
 
 ```bash
 python3 -m fp8_bench.tuning.search_bmm \
   --suite legacy \
-  --impl triton_per_channel_k
+  --impl triton_per_tensor_a_k_b_n \
+  --impl triton_per_tensor_a_k_b_n_tma
+```
+
+直接搜索 A M-major、B N-major 的 linear wgrad 布局：
+
+```bash
+python3 -m fp8_bench.tuning.search_bmm \
+  --suite legacy \
+  --impl triton_per_tensor_a_m_b_n \
+  --impl triton_per_tensor_a_m_b_n_tma
+```
+
+kernel 中现有的 base/TMA config 池已经分别合并了 legacy suite 上
+`a_m_b_n` 的 per-tensor、per-channel 和 per-block 去重赢家；autotune key
+包含 `A_K_MAJOR` 与 `B_N_MAJOR`，不同布局会独立选择配置。
+
+每个 `.best.json` 的 `best_by_case` 保存该实现的逐 shape winner，`by_impl`
+给出 `unique_configs` 和可直接贴回 `_CONFIGS` 的 `triton_configs`。搜索
+per-channel K-major：
+
+```bash
+python3 -m fp8_bench.tuning.search_bmm \
+  --suite legacy \
+  --impl triton_per_channel_a_k_b_k
 ```
 
 Per-block 会额外按 `QBK >= BLOCK_K` 且 `QBK % BLOCK_K == 0` 过滤：
@@ -230,7 +324,7 @@ Per-block 会额外按 `QBK >= BLOCK_K` 且 `QBK % BLOCK_K == 0` 过滤：
 ```bash
 python3 -m fp8_bench.tuning.search_bmm \
   --suite legacy \
-  --impl triton_per_block_n \
+  --impl triton_per_block_2d_a_k_b_n \
   --quant-block-m 128 \
   --quant-block-k 256 \
   --quant-block-n 128
@@ -239,14 +333,21 @@ python3 -m fp8_bench.tuning.search_bmm \
 默认搜索 `BM>=64、BN>=8、BK>=32`，并要求 WGMMA/HGMMA 和零 spill。
 调试非 Hopper 环境或检查过滤逻辑时，可临时使用
 `--no-require-wgmma`、`--no-reject-local-memory` 或
-`--no-static-resource-filter`。`--prebench-top-k 0` 会短测所有通过编译
-筛选的配置；默认只短测启发式排名前 64 个，再正式复测前 8 个。
+`--no-static-resource-filter`。短测所有通过编译筛选的配置，再按耗时取
+前 `--quick-top-k`（默认 8）个做正式复测。
 
 默认结果写到：
 
 ```text
 results/tuning/<impl>_<suite>.jsonl
 results/tuning/<impl>_<suite>.best.json
+```
+
+例如 per-tensor、A 按 M 连续、B 按 N 连续、TMA、legacy shape suite 的结果为：
+
+```text
+results/tuning/triton_per_tensor_a_m_b_n_tma_legacy.jsonl
+results/tuning/triton_per_tensor_a_m_b_n_tma_legacy.best.json
 ```
 
 JSONL 会保留每个 config 的编译失败原因、寄存器、local/shared memory、
@@ -261,8 +362,9 @@ transpose 时间混进 config 选择；端到端 transpose 成本仍由
 
 ## NCU
 
-profile target 默认 warmup 5 次，然后再 launch 一次。NCU 用
-`--launch-skip 5` 跳过 warmup。
+profile target 默认先 warmup 5 次。第一次 warmup 会完成 Triton autotune，
+最后一次待采集 launch 放在 `fp8_bench_profile` NVTX range 中。NCU 只选择
+这个 range，因此候选 config 和 warmup kernel 不会混进报告。
 
 Quant：
 
@@ -270,8 +372,10 @@ Quant：
 mkdir -p reports
 ncu \
   --set full \
+  --import-source yes \
+  --nvtx \
+  --nvtx-include 'fp8_bench_profile/' \
   --kernel-name 'regex:.*fp8_quant_kernel.*' \
-  --launch-skip 5 \
   --launch-count 1 \
   -o reports/quant_q_b32_m2048_k960 \
   python3 -m fp8_bench.profile_one \
@@ -286,14 +390,16 @@ Per-block quant：
 ```bash
 ncu \
   --set basic \
+  --import-source yes \
+  --nvtx \
+  --nvtx-include 'fp8_bench_profile/' \
   --kernel-name 'regex:.*fp8_per_block_quant_kernel.*' \
-  --launch-skip 5 \
   --launch-count 1 \
   -o reports/per_block_quant \
   python3 -m fp8_bench.profile_one \
     --op quant \
     --case q_smoke_3d \
-    --impl triton_per_block \
+    --impl triton_per_block_2d \
     --block-m 128 \
     --block-n 128 \
     --warmup 5
@@ -305,35 +411,43 @@ BMM：
 mkdir -p reports
 ncu \
   --set full \
+  --import-source yes \
+  --nvtx \
+  --nvtx-include 'fp8_bench_profile/' \
   --kernel-name 'regex:.*batch_fp8_per_tensor_bmm_kernel.*' \
-  --launch-skip 5 \
   --launch-count 1 \
   -o reports/bmm_b16_m512_n960_k1280 \
   python3 -m fp8_bench.profile_one \
     --op bmm \
     --case b16_m512_n960_k1280 \
-    --impl triton_per_tensor_n \
+    --impl triton_per_tensor_a_k_b_n \
     --warmup 5
 ```
 
-把 `--impl` 换成 `triton_per_tensor_k` 或
-`triton_per_tensor_n_transpose` 即可 profile 另外两条路径。这里的
+把 `--impl` 换成 `triton_per_tensor_a_k_b_k` 或
+`triton_per_tensor_a_k_b_n_transpose` 即可 profile 另外两条路径。这里的
 kernel-name 过滤器只采集最终 BMM kernel；显式重排的端到端成本以
 `bench_bmm` 的 `bmm-only` 时间为准。
+
+采集 TMA 时增加 `--backend tma`，并把 kernel filter 改为
+`regex:.*batch_fp8_per_tensor_bmm_tma_kernel.*`。`--import-source yes`
+会把关联到的 Triton 源码永久写进 `.ncu-rep`，报告复制到其他机器后也能查看。
 
 Per-channel BMM 的 NCU 命令：
 
 ```bash
 ncu \
   --set basic \
+  --import-source yes \
+  --nvtx \
+  --nvtx-include 'fp8_bench_profile/' \
   --kernel-name 'regex:.*batch_fp8_per_channel_bmm_kernel.*' \
-  --launch-skip 5 \
   --launch-count 1 \
   -o reports/per_channel_n \
   python3 -m fp8_bench.profile_one \
     --op bmm \
     --case bmm_smoke_aligned \
-    --impl triton_per_channel_n \
+    --impl triton_per_channel_a_k_b_n \
     --warmup 5
 ```
 
@@ -342,14 +456,16 @@ Per-block BMM：
 ```bash
 ncu \
   --set basic \
+  --import-source yes \
+  --nvtx \
+  --nvtx-include 'fp8_bench_profile/' \
   --kernel-name 'regex:.*batch_fp8_per_block_bmm_kernel.*' \
-  --launch-skip 5 \
   --launch-count 1 \
   -o reports/per_block_n \
   python3 -m fp8_bench.profile_one \
     --op bmm \
     --case bmm_smoke_aligned \
-    --impl triton_per_block_n \
+    --impl triton_per_block_2d_a_k_b_n \
     --quant-block-m 128 \
     --quant-block-k 128 \
     --quant-block-n 128 \
@@ -392,12 +508,43 @@ dgrad 和 wgrad 估算 GEMM FLOPs，不包含通信、LayerNorm、激活和 opti
 
 ## 输出
 
-默认结果追加写到：
+默认结果写到：
 
 ```text
 results/quant.jsonl
 results/bmm.jsonl
 results/fsdp2.jsonl
+```
+
+`bench_bmm` 每次启动时会先清空目标 JSONL，再逐项实时写入本次运行的结果，
+因此默认的 `results/bmm.jsonl` 不会混入以前的 benchmark。需要保留多次运行时，
+应通过 `--results` 为每次运行指定不同文件名。Quant 和 FSDP2 仍保持追加写入。
+
+三个 `bench_*` 会在每项完成后打印简短进度，并在本次运行结束时用 pandas
+输出一张对齐宽表；性能和精度字段会合并在同一行。JSONL 仍然逐项立即写入，
+因此长任务中途退出不会丢失已经完成的结果。
+
+逐项进度里，BMM 会直接显示对应 scope 的耗时和 TFLOPS；Quant 与 FSDP2
+显示 `duration`。汇总表中 Quant/FSDP2 的耗时统一命名为 `duration_ms`。
+Triton Quant/BMM 在 autotune 完成后还会读取 kernel 的 `.best_config`：逐项输出
+和 pandas 表显示紧凑配置，JSONL 的 `best_config` 字段保留完整结构化配置。
+FSDP2 没有对应的单一 Triton autotuner，因此不输出 `best_config`。
+
+已有 JSONL 可以重新排序、选择列或导出 CSV：
+
+```bash
+python3 -m fp8_bench.report results/bmm.jsonl \
+  --kind bmm \
+  --sort bmm_tflops \
+  --descending
+
+python3 -m fp8_bench.report results/bmm.jsonl \
+  --column case \
+  --column impl \
+  --column backend \
+  --column bmm_ms \
+  --column bmm_tflops \
+  --csv results/bmm.csv
 ```
 
 可以用 `--results` 指定其他文件。每条记录带 shape、实现名、dtype、GPU、

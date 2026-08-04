@@ -6,13 +6,18 @@ from typing import Iterable
 import torch
 
 from fp8_bench.cases import QUANT_SUITES, QuantCase
+from fp8_bench.reporting import (
+    format_triton_config,
+    print_progress,
+    print_records,
+    triton_config_dict,
+)
 from fp8_bench.registry import QUANT_IMPLS, get_quant, load_builtin_impls
 from fp8_bench.utils import (
     accuracy_metrics,
     append_jsonl,
     benchmark_cuda,
     parse_dtype,
-    print_perf,
     result_record,
     seed_everything,
 )
@@ -43,15 +48,20 @@ def main() -> None:
     parser.add_argument("--input-dtype", default="fp32")
     parser.add_argument("--fp8-dtype", choices=["e4m3", "e5m2"], default="e4m3")
     parser.add_argument(
+        "--channel-axis",
+        type=int,
+        choices=[-2, -1],
+        default=-1,
+        help="Channel axis for per-channel implementations (default: -1).",
+    )
+    parser.add_argument(
         "--block-m",
         type=int,
-        default=128,
         help="Override the row block size for per-block quantization.",
     )
     parser.add_argument(
         "--block-n",
         type=int,
-        default=128,
         help="Override the column block size for per-block quantization.",
     )
     parser.add_argument("--warmup", type=int, default=20)
@@ -67,16 +77,27 @@ def main() -> None:
     input_dtype = parse_dtype(args.input_dtype)
     fp8_dtype = parse_dtype(args.fp8_dtype)
     impl_names = args.impl or sorted(QUANT_IMPLS)
+    cases = list(_cases(args.suite, args.case))
+    total_runs = len(cases) * len(impl_names)
+    completed_runs = 0
+    records: list[dict[str, object]] = []
 
-    for case in _cases(args.suite, args.case):
+    for case in cases:
         x = torch.randn(case.shape, device="cuda", dtype=input_dtype)
         for impl_name in impl_names:
             impl = get_quant(impl_name)
             quant_kwargs = {}
-            if impl_name == "triton_per_block":
+            if "per_channel" in impl_name:
+                quant_kwargs["channel_axis"] = args.channel_axis
+            if impl_name.startswith("triton_per_block_"):
+                default_block_m = 1 if impl_name.endswith("_1d") else 128
                 quant_kwargs = {
-                    "block_m": args.block_m,
-                    "block_n": args.block_n,
+                    "block_m": (
+                        args.block_m
+                        if args.block_m is not None
+                        else default_block_m
+                    ),
+                    "block_n": args.block_n if args.block_n is not None else 128,
                 }
             values = {
                 "suite": args.suite,
@@ -104,11 +125,6 @@ def main() -> None:
                 traffic_bytes = x.numel() * (x.element_size() + 1)
                 perf["bandwidth_gbps"] = traffic_bytes / perf["median_ms"] / 1e6
                 values["performance"] = perf
-                print_perf(
-                    f"quant {case.name} [{impl_name}]",
-                    perf,
-                    extra=f"  {perf['bandwidth_gbps']:.1f} GB/s",
-                )
 
             if args.mode in {"accuracy", "both"}:
                 result = impl.fn(
@@ -130,15 +146,30 @@ def main() -> None:
                     metrics["dequant_scale_max"] = float(scale.max().item())
                     metrics["dequant_scale_mean"] = float(scale.mean().item())
                 values["accuracy"] = metrics
-                print(
-                    f"accuracy {case.name} [{impl_name}]"
-                    f"  rel_l2={metrics['rel_l2']:.6g}"
-                    f" cosine={metrics['cosine']:.6g}"
-                    f" mse={metrics['mse']:.6g}"
-                    f" max_abs={metrics['max_abs']:.6g}"
-                )
 
-            append_jsonl(args.results, result_record("quant", **values))
+            best_config = impl.get_best_config()
+            if best_config is not None:
+                values["best_config"] = triton_config_dict(best_config)
+
+            record = result_record("quant", **values)
+            append_jsonl(args.results, record)
+            records.append(record)
+            completed_runs += 1
+            performance_parts = []
+            if perf := values.get("performance"):
+                performance_parts.append(
+                    f"duration={perf['median_ms']:.4f} ms"
+                )
+            if config_text := format_triton_config(best_config):
+                performance_parts.append(f"config={config_text}")
+            print_progress(
+                completed_runs,
+                total_runs,
+                f"{case.name} [{impl_name}]",
+                performance="  ".join(performance_parts) or None,
+            )
+
+    print_records(records, title="Quant summary")
 
 
 if __name__ == "__main__":

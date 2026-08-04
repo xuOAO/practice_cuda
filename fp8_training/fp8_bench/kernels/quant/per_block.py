@@ -48,10 +48,14 @@ def fp8_per_block_quant_kernel(
     tl.store(y_ptr + offs_y, y, mask=mask)
         
 _CONFIGS = [
+    # Quant block sizes define numerical semantics. Only tune CTA scheduling;
+    # BLOCK_M/BLOCK_N in the autotune key select independently for 1D and 2D.
+    triton.Config({}, num_warps=2, num_stages=2),
     triton.Config({}, num_warps=4, num_stages=2),
+    triton.Config({}, num_warps=8, num_stages=2),
 ]
 
 fp8_per_block_quant_kernel_autotuned = triton.autotune(
     configs=_CONFIGS,
-    key=["m", "n", "BLOCK_M", "BLOCK_N"],
+    key=["m", "n", "stride_xn", "stride_yn", "BLOCK_M", "BLOCK_N"],
 )(fp8_per_block_quant_kernel)

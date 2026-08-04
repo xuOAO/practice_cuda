@@ -42,6 +42,17 @@ def _matrix_layout(tensor: torch.Tensor, name: str) -> str:
     )
 
 
+def _a_layout(tensor: torch.Tensor) -> str:
+    if tensor.stride(-1) == 1:
+        return "k-major"
+    if tensor.stride(-2) == 1:
+        return "m-major"
+    raise ValueError(
+        "A must be contiguous along either K or M; "
+        f"shape={tuple(tensor.shape)}, strides={tensor.stride()}"
+    )
+
+
 def _is_power_of_two(value: int) -> bool:
     return value > 0 and (value & (value - 1)) == 0
 
@@ -65,7 +76,11 @@ def triton_per_block_quant(
             f"got block_m={block_m}, block_n={block_n}"
         )
 
-    output = torch.empty(x.shape, device=x.device, dtype=fp8_dtype)
+    output = torch.empty_like(
+        x,
+        dtype=fp8_dtype,
+        memory_format=torch.preserve_format,
+    )
     if x.ndim == 2:
         batch = 1
         m, n = x.shape
@@ -135,18 +150,24 @@ def triton_per_block_quant(
     )
 
 
+def prepare_a_layout(value: QuantResult, layout: str) -> QuantResult:
+    if layout not in {"k", "m"}:
+        raise ValueError(f"unknown A layout: {layout}")
+    actual = _a_layout(value.tensor)
+    expected = f"{layout}-major"
+    if actual != expected:
+        raise ValueError(f"expected {expected} A, got {actual}")
+    return value
+
+
 def prepare_b_layout(value: QuantResult, layout: str) -> QuantResult:
-    if layout == "n":
-        return value
-    if layout != "k":
+    if layout not in {"n", "k"}:
         raise ValueError(f"unknown B layout: {layout}")
-    return QuantResult(
-        tensor=value.tensor.transpose(-1, -2).contiguous().transpose(-1, -2),
-        dequant_scale=value.dequant_scale,
-        impl=value.impl,
-        granularity=value.granularity,
-        meta={**value.meta, "layout": "k"},
-    )
+    actual = _matrix_layout(value.tensor, "B")
+    expected = f"{layout}-major"
+    if actual != expected:
+        raise ValueError(f"expected {expected} B, got {actual}")
+    return value
 
 
 def _validate_scale(
@@ -215,19 +236,31 @@ def triton_per_block_bmm(
     out_dtype: torch.dtype = torch.bfloat16,
     bias: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    do_transpose_a: bool = False,
     do_transpose_b: bool = False,
     profile: bool = False,
     use_tma: bool = False,
+    activation: str = "none",
 ) -> torch.Tensor:
     if a.tensor.ndim != 3 or b.tensor.ndim != 3:
         raise ValueError("BMM expects 3D quantized tensors")
 
-    a_tensor = a.tensor
-    if a_tensor.stride(-1) != 1:
+    if activation not in ("none", "gelu"):
         raise ValueError(
-            "A must be contiguous along K; "
-            f"shape={tuple(a_tensor.shape)}, strides={a_tensor.stride()}"
+            f"activation must be 'none' or 'gelu', got {activation!r}"
         )
+
+    input_a_layout = _a_layout(a.tensor)
+    if do_transpose_a:
+        if input_a_layout != "m-major":
+            raise ValueError(
+                "do_transpose_a=True requires an M-major A input; "
+                f"strides={a.tensor.stride()}"
+            )
+        a_tensor = a.tensor.contiguous()
+    else:
+        a_tensor = a.tensor
+    a_k_major = _a_layout(a_tensor) == "k-major"
 
     input_b_layout = _matrix_layout(b.tensor, "B")
     if do_transpose_b:
@@ -379,62 +412,126 @@ def triton_per_block_bmm(
         *a.dequant_scale.stride(),
         *b.dequant_scale.stride(),
         USE_BIAS=bias is not None,
+        A_K_MAJOR=a_k_major,
         B_N_MAJOR=b_n_major,
+        ACTIVATION=activation,
         **launch_kwargs,
     )
     return out
 
 
-register_quant(
-    "triton_per_block",
-    triton_per_block_quant,
-    "Per-block scale quantization; supports E4M3 and E5M2.",
+def _quant_best_config():
+    return getattr(fp8_per_block_quant_kernel_autotuned, "best_config", None)
+
+
+def _bmm_best_config(use_tma: bool):
+    kernel = (
+        batch_fp8_per_block_bmm_tma_kernel_autotuned
+        if use_tma
+        else batch_fp8_per_block_bmm_kernel_autotuned
+    )
+    return getattr(kernel, "best_config", None)
+
+
+def _register_block_scheme(
+    quant_impl: str,
+    *,
+    quant_block_m: int,
+    quant_block_k: int,
+    quant_block_n: int,
+    description: str,
+) -> None:
+    register_quant(
+        quant_impl,
+        partial(
+            triton_per_block_quant,
+            block_m=quant_block_m,
+            block_n=quant_block_k,
+        ),
+        description,
+        get_best_config=_quant_best_config,
+    )
+
+    quant_a_kwargs = {
+        "block_m": quant_block_m,
+        "block_n": quant_block_k,
+    }
+    quant_b_kwargs = {
+        "block_m": quant_block_k,
+        "block_n": quant_block_n,
+    }
+    common = {
+        "quant_impl": quant_impl,
+        "quant_a_kwargs": quant_a_kwargs,
+        "quant_b_kwargs": quant_b_kwargs,
+        "get_best_config": _bmm_best_config,
+    }
+
+    register_bmm(
+        f"{quant_impl}_a_k_b_n",
+        partial(triton_per_block_bmm, do_transpose_b=False),
+        layout="n",
+        prepare_b=lambda value: prepare_b_layout(value, "n"),
+        description="Per-block FP8 BMM with an N-major [B,K,N] right operand.",
+        **common,
+    )
+    register_bmm(
+        f"{quant_impl}_a_k_b_k",
+        partial(triton_per_block_bmm, do_transpose_b=False),
+        layout="k",
+        prepare_b=lambda value: prepare_b_layout(value, "k"),
+        description="Per-block FP8 BMM with a prepacked K-major right operand.",
+        **common,
+    )
+    register_bmm(
+        f"{quant_impl}_a_k_b_n_transpose",
+        partial(triton_per_block_bmm, do_transpose_b=True),
+        layout="n",
+        prepare_b=lambda value: prepare_b_layout(value, "n"),
+        description="N-major per-block FP8 BMM with packing inside the call.",
+        **common,
+    )
+    register_bmm(
+        f"{quant_impl}_a_m_b_n",
+        partial(
+            triton_per_block_bmm,
+            do_transpose_a=False,
+            do_transpose_b=False,
+        ),
+        a_layout="m",
+        layout="n",
+        prepare_a=lambda value: prepare_a_layout(value, "m"),
+        prepare_b=lambda value: prepare_b_layout(value, "n"),
+        description="Per-block FP8 BMM with direct M-major A and N-major B operands.",
+        **common,
+    )
+    register_bmm(
+        f"{quant_impl}_a_m_transpose_b_n_transpose",
+        partial(
+            triton_per_block_bmm,
+            do_transpose_a=True,
+            do_transpose_b=True,
+        ),
+        a_layout="m",
+        layout="n",
+        prepare_a=lambda value: prepare_a_layout(value, "m"),
+        prepare_b=lambda value: prepare_b_layout(value, "n"),
+        description="M-major A and N-major B packed inside the per-block BMM call.",
+        **common,
+    )
+
+
+_register_block_scheme(
+    "triton_per_block_1d",
+    quant_block_m=1,
+    quant_block_k=_DEFAULT_QUANT_BLOCK_K,
+    quant_block_n=1,
+    description="1D K-block scale quantization; defaults to 1x128 blocks.",
 )
-register_bmm(
-    "triton_per_block_n",
-    partial(triton_per_block_bmm, do_transpose_b=False),
-    quant_impl="triton_per_block",
-    quant_a_kwargs={
-        "block_m": _DEFAULT_QUANT_BLOCK_M,
-        "block_n": _DEFAULT_QUANT_BLOCK_K,
-    },
-    quant_b_kwargs={
-        "block_m": _DEFAULT_QUANT_BLOCK_K,
-        "block_n": _DEFAULT_QUANT_BLOCK_N,
-    },
-    layout="n",
-    prepare_b=lambda value: prepare_b_layout(value, "n"),
-    description="Per-block FP8 BMM with an N-major [B,K,N] right operand.",
-)
-register_bmm(
-    "triton_per_block_k",
-    partial(triton_per_block_bmm, do_transpose_b=False),
-    quant_impl="triton_per_block",
-    quant_a_kwargs={
-        "block_m": _DEFAULT_QUANT_BLOCK_M,
-        "block_n": _DEFAULT_QUANT_BLOCK_K,
-    },
-    quant_b_kwargs={
-        "block_m": _DEFAULT_QUANT_BLOCK_K,
-        "block_n": _DEFAULT_QUANT_BLOCK_N,
-    },
-    layout="k",
-    prepare_b=lambda value: prepare_b_layout(value, "k"),
-    description="Per-block FP8 BMM with a prepacked K-major right operand.",
-)
-register_bmm(
-    "triton_per_block_n_transpose",
-    partial(triton_per_block_bmm, do_transpose_b=True),
-    quant_impl="triton_per_block",
-    quant_a_kwargs={
-        "block_m": _DEFAULT_QUANT_BLOCK_M,
-        "block_n": _DEFAULT_QUANT_BLOCK_K,
-    },
-    quant_b_kwargs={
-        "block_m": _DEFAULT_QUANT_BLOCK_K,
-        "block_n": _DEFAULT_QUANT_BLOCK_N,
-    },
-    layout="n",
-    prepare_b=lambda value: prepare_b_layout(value, "n"),
-    description="N-major per-block FP8 BMM with packing inside the call.",
+_register_block_scheme(
+    "triton_per_block_2d",
+    quant_block_m=_DEFAULT_QUANT_BLOCK_M,
+    quant_block_k=_DEFAULT_QUANT_BLOCK_K,
+    quant_block_n=_DEFAULT_QUANT_BLOCK_N,
+    description="2D block scale quantization; defaults to 128x128 blocks.",
 )

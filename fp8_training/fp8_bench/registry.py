@@ -75,6 +75,7 @@ class QuantImpl:
     name: str
     fn: Callable[..., QuantResult]
     description: str = ""
+    get_best_config: Callable[[], Any | None] = lambda: None
 
 
 @dataclass(frozen=True)
@@ -82,23 +83,51 @@ class BMMImpl:
     name: str
     fn: Callable[..., torch.Tensor]
     quant_impl: str
+    a_layout: str
     layout: str
+    prepare_a: Callable[[QuantResult], QuantResult]
     prepare_b: Callable[[QuantResult], QuantResult]
     quant_a_kwargs: dict[str, Any]
     quant_b_kwargs: dict[str, Any]
     prepare_call_kwargs: Callable[[QuantResult, QuantResult], dict[str, Any]]
     description: str = ""
+    get_best_config: Callable[[bool], Any | None] = lambda _use_tma: None
 
 
 QUANT_IMPLS: dict[str, QuantImpl] = {}
 BMM_IMPLS: dict[str, BMMImpl] = {}
 _BUILTINS_LOADED = False
 
+_BMM_QUANT_ORDER = {
+    "triton_per_block_1d": 0,
+    "triton_per_block_2d": 1,
+    "triton_per_channel": 2,
+    "triton_per_tensor": 3,
+}
+_BMM_LAYOUT_ORDER = {
+    "a_k_b_k": 0,
+    "a_k_b_n": 1,
+    "a_k_b_n_transpose": 2,
+    "a_m_b_n": 3,
+    "a_m_transpose_b_n_transpose": 4,
+}
 
-def register_quant(name: str, fn: Callable[..., QuantResult], description: str = "") -> None:
+
+def register_quant(
+    name: str,
+    fn: Callable[..., QuantResult],
+    description: str = "",
+    *,
+    get_best_config: Callable[[], Any | None] | None = None,
+) -> None:
     if name in QUANT_IMPLS:
         raise ValueError(f"duplicate quant implementation: {name}")
-    QUANT_IMPLS[name] = QuantImpl(name, fn, description)
+    QUANT_IMPLS[name] = QuantImpl(
+        name,
+        fn,
+        description,
+        get_best_config or (lambda: None),
+    )
 
 
 def register_bmm(
@@ -108,27 +137,35 @@ def register_bmm(
     quant_impl: str,
     layout: str,
     prepare_b: Callable[[QuantResult], QuantResult],
+    a_layout: str = "k",
+    prepare_a: Callable[[QuantResult], QuantResult] | None = None,
     quant_a_kwargs: dict[str, Any] | None = None,
     quant_b_kwargs: dict[str, Any] | None = None,
     prepare_call_kwargs: (
         Callable[[QuantResult, QuantResult], dict[str, Any]] | None
     ) = None,
     description: str = "",
+    get_best_config: Callable[[bool], Any | None] | None = None,
 ) -> None:
     if name in BMM_IMPLS:
         raise ValueError(f"duplicate BMM implementation: {name}")
+    if a_layout not in {"m", "k"}:
+        raise ValueError(f"a_layout must be 'm' or 'k', got {a_layout}")
     if layout not in {"n", "k"}:
         raise ValueError(f"layout must be 'n' or 'k', got {layout}")
     BMM_IMPLS[name] = BMMImpl(
         name,
         fn,
         quant_impl,
+        a_layout,
         layout,
+        prepare_a or (lambda value: value),
         prepare_b,
         dict(quant_a_kwargs or {}),
         dict(quant_b_kwargs or {}),
         prepare_call_kwargs or (lambda _a, _b: {}),
         description,
+        get_best_config or (lambda _use_tma: None),
     )
 
 
@@ -137,6 +174,23 @@ def load_builtin_impls() -> None:
     if not _BUILTINS_LOADED:
         importlib.import_module("fp8_bench.impls")
         _BUILTINS_LOADED = True
+
+
+def bmm_impl_names() -> list[str]:
+    """Return registered BMMs grouped by quantization and logical layout."""
+    load_builtin_impls()
+
+    def sort_key(name: str) -> tuple[int, str, int, str]:
+        impl = BMM_IMPLS[name]
+        layout_name = name.removeprefix(f"{impl.quant_impl}_")
+        return (
+            _BMM_QUANT_ORDER.get(impl.quant_impl, len(_BMM_QUANT_ORDER)),
+            impl.quant_impl,
+            _BMM_LAYOUT_ORDER.get(layout_name, len(_BMM_LAYOUT_ORDER)),
+            name,
+        )
+
+    return sorted(BMM_IMPLS, key=sort_key)
 
 
 def get_quant(name: str) -> QuantImpl:

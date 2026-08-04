@@ -9,7 +9,7 @@ import torch
 from triton.runtime import driver
 
 from fp8_bench.tuning.adapters import BMMTuningAdapter, TuningSpec
-from fp8_bench.tuning.space import KernelConfig, cdiv
+from fp8_bench.tuning.space import KernelConfig
 
 
 def _metadata_get(metadata: Any, name: str, default: Any = None) -> Any:
@@ -255,29 +255,3 @@ def compile_filter(
         for config in configs
     ]
     return [result for result in all_results if result.accepted], all_results
-
-
-def tile_efficiency(config: KernelConfig, spec: TuningSpec) -> float:
-    padded_m = cdiv(spec.m, config.block_m) * config.block_m
-    padded_n = cdiv(spec.n, config.block_n) * config.block_n
-    padded_k = cdiv(spec.k, config.block_k) * config.block_k
-    return spec.m * spec.n * spec.k / (padded_m * padded_n * padded_k)
-
-
-def wave_metrics(
-    result: CompileResult,
-    spec: TuningSpec,
-    limits: DeviceLimits,
-) -> tuple[float | None, float | None]:
-    if not result.active_ctas_per_sm:
-        return None, None
-    total_ctas = (
-        spec.batch
-        * cdiv(spec.m, result.config.block_m)
-        * cdiv(spec.n, result.config.block_n)
-    )
-    capacity = limits.sms * result.active_ctas_per_sm
-    waves = cdiv(total_ctas, capacity)
-    sm_fill = min(1.0, total_ctas / limits.sms)
-    wave_efficiency = total_ctas / (waves * capacity)
-    return sm_fill, wave_efficiency

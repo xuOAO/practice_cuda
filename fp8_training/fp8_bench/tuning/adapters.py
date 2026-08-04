@@ -5,10 +5,64 @@ from typing import Any, Callable, Protocol
 
 import torch
 
-from fp8_bench.kernels.bmm.per_block import batch_fp8_per_block_bmm_kernel
-from fp8_bench.kernels.bmm.per_channel import batch_fp8_per_channel_bmm_kernel
-from fp8_bench.kernels.bmm.per_tensor import batch_fp8_per_tensor_bmm_kernel
+import triton
+
+from fp8_bench.kernels.bmm.per_block import (
+    batch_fp8_per_block_bmm_kernel,
+    batch_fp8_per_block_bmm_tma_kernel,
+)
+from fp8_bench.kernels.bmm.per_channel import (
+    batch_fp8_per_channel_bmm_kernel,
+    batch_fp8_per_channel_bmm_tma_kernel,
+)
+from fp8_bench.kernels.bmm.per_tensor import (
+    batch_fp8_per_tensor_bmm_kernel,
+    batch_fp8_per_tensor_bmm_tma_kernel,
+)
 from fp8_bench.tuning.space import KernelConfig, cdiv
+
+
+def _tma_alloc_fn(size: int, alignment: int, stream: Any) -> torch.Tensor:
+    return torch.empty(size, device="cuda", dtype=torch.int8)
+
+
+def _ensure_tma_allocator() -> None:
+    # TMA tensor descriptors need a device-side allocator for descriptor memory.
+    # It is global and idempotent; setting it does not affect non-TMA kernels.
+    triton.set_allocator(_tma_alloc_fn)
+
+
+def _assert_tma_aligned(
+    spec: "TuningSpec",
+    a_k_major: bool,
+    b_n_major: bool,
+) -> None:
+    # TMA descriptors require 16-byte aligned leading strides. For fp8 (1 byte)
+    # that means K must be a multiple of 16 (A's leading stride), and for
+    # N-major B the leading stride is N, so N must also be a multiple of 16.
+    a_leading_dim = spec.k if a_k_major else spec.m
+    if a_leading_dim % 16 != 0:
+        raise ValueError(
+            "TMA requires A's leading stride to be 16-byte aligned, got "
+            f"A layout={'K' if a_k_major else 'N'}-major and "
+            f"leading_dim={a_leading_dim}"
+        )
+    b_leading_dim = spec.n if b_n_major else spec.k
+    if b_leading_dim % 16 != 0:
+        raise ValueError(
+            "TMA requires B's leading stride to be 16-byte aligned, got "
+            f"B layout={'N' if b_n_major else 'K'}-major and "
+            f"leading_dim={b_leading_dim}"
+        )
+    output_stride_bytes = (
+        spec.n * torch.empty((), dtype=spec.out_dtype).element_size()
+    )
+    if output_stride_bytes % 16 != 0:
+        raise ValueError(
+            "TMA requires C's leading stride to be 16-byte aligned, got "
+            f"N={spec.n}, dtype={spec.out_dtype}, "
+            f"stride_bytes={output_stride_bytes}"
+        )
 
 
 @dataclass(frozen=True)
@@ -58,6 +112,7 @@ class RuntimeTensors:
 class BMMTuningAdapter(Protocol):
     name: str
     family: str
+    a_k_major: bool
     b_n_major: bool
 
     def compile(self, spec: TuningSpec, config: KernelConfig) -> Any:
@@ -75,13 +130,21 @@ class BMMTuningAdapter(Protocol):
         ...
 
 
-def _matrix_strides(spec: TuningSpec, b_n_major: bool) -> dict[str, tuple[int, ...]]:
+def _matrix_strides(
+    spec: TuningSpec,
+    a_k_major: bool,
+    b_n_major: bool,
+) -> dict[str, tuple[int, ...]]:
+    if a_k_major:
+        a_strides = (spec.m * spec.k, spec.k, 1)
+    else:
+        a_strides = (spec.m * spec.k, 1, spec.m)
     if b_n_major:
         b_strides = (spec.k * spec.n, spec.n, 1)
     else:
         b_strides = (spec.k * spec.n, 1, spec.k)
     return {
-        "a": (spec.m * spec.k, spec.k, 1),
+        "a": a_strides,
         "b": b_strides,
         "c": (spec.m * spec.n, spec.n, 1),
         "bias": (spec.m * spec.n, spec.n, 1) if spec.use_bias else (0, 0, 0),
@@ -90,13 +153,21 @@ def _matrix_strides(spec: TuningSpec, b_n_major: bool) -> dict[str, tuple[int, .
 
 def _make_matrices(
     spec: TuningSpec,
+    a_k_major: bool,
     b_n_major: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    a = torch.empty(
-        (spec.batch, spec.m, spec.k),
-        device="cuda",
-        dtype=spec.fp8_dtype,
-    )
+    if a_k_major:
+        a = torch.empty(
+            (spec.batch, spec.m, spec.k),
+            device="cuda",
+            dtype=spec.fp8_dtype,
+        )
+    else:
+        a = torch.empty(
+            (spec.batch, spec.k, spec.m),
+            device="cuda",
+            dtype=spec.fp8_dtype,
+        ).transpose(-1, -2)
     if b_n_major:
         b = torch.empty(
             (spec.batch, spec.k, spec.n),
@@ -134,16 +205,24 @@ def _make_bias(
 class _BaseAdapter:
     family: str
 
-    def __init__(self, name: str, kernel: Any, *, b_n_major: bool) -> None:
+    def __init__(
+        self,
+        name: str,
+        kernel: Any,
+        *,
+        a_k_major: bool,
+        b_n_major: bool,
+    ) -> None:
         self.name = name
         self.kernel = kernel
+        self.a_k_major = a_k_major
         self.b_n_major = b_n_major
 
     def _compile_common(
         self,
         spec: TuningSpec,
     ) -> tuple[Any, ...]:
-        strides = _matrix_strides(spec, self.b_n_major)
+        strides = _matrix_strides(spec, self.a_k_major, self.b_n_major)
         bias_dtype = spec.out_dtype if spec.use_bias else spec.fp8_dtype
         return (
             spec.fp8_dtype,
@@ -166,7 +245,9 @@ class _BaseAdapter:
     ) -> dict[str, Any]:
         return {
             "USE_BIAS": spec.use_bias,
+            "A_K_MAJOR": self.a_k_major,
             "B_N_MAJOR": self.b_n_major,
+            "ACTIVATION": "none",
             **config.as_triton_kwargs(),
             "num_warps": config.num_warps,
             "num_stages": config.num_stages,
@@ -186,10 +267,18 @@ class _BaseAdapter:
 class PerTensorAdapter(_BaseAdapter):
     family = "per_tensor"
 
-    def __init__(self, name: str, *, b_n_major: bool) -> None:
+    def __init__(
+        self,
+        name: str,
+        *,
+        b_n_major: bool,
+        a_k_major: bool = True,
+        kernel: Any = batch_fp8_per_tensor_bmm_kernel,
+    ) -> None:
         super().__init__(
             name,
-            batch_fp8_per_tensor_bmm_kernel,
+            kernel,
+            a_k_major=a_k_major,
             b_n_major=b_n_major,
         )
 
@@ -203,7 +292,7 @@ class PerTensorAdapter(_BaseAdapter):
         )
 
     def create_runtime(self, spec: TuningSpec) -> RuntimeTensors:
-        a, b, c = _make_matrices(spec, self.b_n_major)
+        a, b, c = _make_matrices(spec, self.a_k_major, self.b_n_major)
         bias_ptr, bias_strides = _make_bias(spec, a)
         scale = torch.ones((), device="cuda", dtype=torch.float32)
         return RuntimeTensors(a, b, c, bias_ptr, bias_strides, scale)
@@ -237,10 +326,18 @@ class PerTensorAdapter(_BaseAdapter):
 class PerChannelAdapter(_BaseAdapter):
     family = "per_channel"
 
-    def __init__(self, name: str, *, b_n_major: bool) -> None:
+    def __init__(
+        self,
+        name: str,
+        *,
+        b_n_major: bool,
+        a_k_major: bool = True,
+        kernel: Any = batch_fp8_per_channel_bmm_kernel,
+    ) -> None:
         super().__init__(
             name,
-            batch_fp8_per_channel_bmm_kernel,
+            kernel,
+            a_k_major=a_k_major,
             b_n_major=b_n_major,
         )
 
@@ -263,7 +360,7 @@ class PerChannelAdapter(_BaseAdapter):
         )
 
     def create_runtime(self, spec: TuningSpec) -> RuntimeTensors:
-        a, b, c = _make_matrices(spec, self.b_n_major)
+        a, b, c = _make_matrices(spec, self.a_k_major, self.b_n_major)
         bias_ptr, bias_strides = _make_bias(spec, a)
         scale_a = torch.ones(
             (spec.batch, spec.m),
@@ -319,10 +416,18 @@ class PerChannelAdapter(_BaseAdapter):
 class PerBlockAdapter(_BaseAdapter):
     family = "per_block"
 
-    def __init__(self, name: str, *, b_n_major: bool) -> None:
+    def __init__(
+        self,
+        name: str,
+        *,
+        b_n_major: bool,
+        a_k_major: bool = True,
+        kernel: Any = batch_fp8_per_block_bmm_kernel,
+    ) -> None:
         super().__init__(
             name,
-            batch_fp8_per_block_bmm_kernel,
+            kernel,
+            a_k_major=a_k_major,
             b_n_major=b_n_major,
         )
 
@@ -384,7 +489,7 @@ class PerBlockAdapter(_BaseAdapter):
         )
 
     def create_runtime(self, spec: TuningSpec) -> RuntimeTensors:
-        a, b, c = _make_matrices(spec, self.b_n_major)
+        a, b, c = _make_matrices(spec, self.a_k_major, self.b_n_major)
         bias_ptr, bias_strides = _make_bias(spec, a)
         _, _, _, num_qbm, num_qbk, num_qbn = self._blocks(spec)
         scale_a = torch.ones(
@@ -438,43 +543,232 @@ class PerBlockAdapter(_BaseAdapter):
         return run
 
 
+class PerTensorTmaAdapter(PerTensorAdapter):
+    def __init__(
+        self,
+        name: str,
+        *,
+        b_n_major: bool,
+        a_k_major: bool = True,
+    ) -> None:
+        _ensure_tma_allocator()
+        super().__init__(
+            name,
+            b_n_major=b_n_major,
+            a_k_major=a_k_major,
+            kernel=batch_fp8_per_tensor_bmm_tma_kernel,
+        )
+
+    def create_runtime(self, spec: TuningSpec) -> RuntimeTensors:
+        _assert_tma_aligned(spec, self.a_k_major, self.b_n_major)
+        return super().create_runtime(spec)
+
+
+class PerChannelTmaAdapter(PerChannelAdapter):
+    def __init__(
+        self,
+        name: str,
+        *,
+        b_n_major: bool,
+        a_k_major: bool = True,
+    ) -> None:
+        _ensure_tma_allocator()
+        super().__init__(
+            name,
+            b_n_major=b_n_major,
+            a_k_major=a_k_major,
+            kernel=batch_fp8_per_channel_bmm_tma_kernel,
+        )
+
+    def create_runtime(self, spec: TuningSpec) -> RuntimeTensors:
+        _assert_tma_aligned(spec, self.a_k_major, self.b_n_major)
+        return super().create_runtime(spec)
+
+
+class PerBlockTmaAdapter(PerBlockAdapter):
+    def __init__(
+        self,
+        name: str,
+        *,
+        b_n_major: bool,
+        a_k_major: bool = True,
+    ) -> None:
+        _ensure_tma_allocator()
+        super().__init__(
+            name,
+            b_n_major=b_n_major,
+            a_k_major=a_k_major,
+            kernel=batch_fp8_per_block_bmm_tma_kernel,
+        )
+
+    def create_runtime(self, spec: TuningSpec) -> RuntimeTensors:
+        _assert_tma_aligned(spec, self.a_k_major, self.b_n_major)
+        return super().create_runtime(spec)
+
+
 ADAPTERS: dict[str, BMMTuningAdapter] = {
-    "triton_per_tensor_n": PerTensorAdapter(
-        "triton_per_tensor_n",
+    "triton_per_tensor_a_k_b_n": PerTensorAdapter(
+        "triton_per_tensor_a_k_b_n",
         b_n_major=True,
     ),
-    "triton_per_tensor_k": PerTensorAdapter(
-        "triton_per_tensor_k",
+    "triton_per_tensor_a_k_b_k": PerTensorAdapter(
+        "triton_per_tensor_a_k_b_k",
         b_n_major=False,
     ),
-    "triton_per_tensor_n_transpose": PerTensorAdapter(
-        "triton_per_tensor_n_transpose",
+    "triton_per_tensor_a_k_b_n_transpose": PerTensorAdapter(
+        "triton_per_tensor_a_k_b_n_transpose",
         b_n_major=False,
     ),
-    "triton_per_channel_n": PerChannelAdapter(
-        "triton_per_channel_n",
+    "triton_per_tensor_a_m_b_n": PerTensorAdapter(
+        "triton_per_tensor_a_m_b_n",
+        a_k_major=False,
         b_n_major=True,
     ),
-    "triton_per_channel_k": PerChannelAdapter(
-        "triton_per_channel_k",
+    "triton_per_tensor_a_m_transpose_b_n_transpose": PerTensorAdapter(
+        "triton_per_tensor_a_m_transpose_b_n_transpose",
+        a_k_major=True,
         b_n_major=False,
     ),
-    "triton_per_channel_n_transpose": PerChannelAdapter(
-        "triton_per_channel_n_transpose",
-        b_n_major=False,
-    ),
-    "triton_per_block_n": PerBlockAdapter(
-        "triton_per_block_n",
+    "triton_per_tensor_a_k_b_n_tma": PerTensorTmaAdapter(
+        "triton_per_tensor_a_k_b_n_tma",
         b_n_major=True,
     ),
-    "triton_per_block_k": PerBlockAdapter(
-        "triton_per_block_k",
+    "triton_per_tensor_a_k_b_k_tma": PerTensorTmaAdapter(
+        "triton_per_tensor_a_k_b_k_tma",
         b_n_major=False,
     ),
-    "triton_per_block_n_transpose": PerBlockAdapter(
-        "triton_per_block_n_transpose",
+    "triton_per_tensor_a_k_b_n_transpose_tma": PerTensorTmaAdapter(
+        "triton_per_tensor_a_k_b_n_transpose_tma",
         b_n_major=False,
     ),
+    "triton_per_tensor_a_m_b_n_tma": PerTensorTmaAdapter(
+        "triton_per_tensor_a_m_b_n_tma",
+        a_k_major=False,
+        b_n_major=True,
+    ),
+    "triton_per_tensor_a_m_transpose_b_n_transpose_tma": PerTensorTmaAdapter(
+        "triton_per_tensor_a_m_transpose_b_n_transpose_tma",
+        a_k_major=True,
+        b_n_major=False,
+    ),
+    "triton_per_channel_a_k_b_n": PerChannelAdapter(
+        "triton_per_channel_a_k_b_n",
+        b_n_major=True,
+    ),
+    "triton_per_channel_a_k_b_k": PerChannelAdapter(
+        "triton_per_channel_a_k_b_k",
+        b_n_major=False,
+    ),
+    "triton_per_channel_a_k_b_n_transpose": PerChannelAdapter(
+        "triton_per_channel_a_k_b_n_transpose",
+        b_n_major=False,
+    ),
+    "triton_per_channel_a_m_b_n": PerChannelAdapter(
+        "triton_per_channel_a_m_b_n",
+        a_k_major=False,
+        b_n_major=True,
+    ),
+    "triton_per_channel_a_m_transpose_b_n_transpose": PerChannelAdapter(
+        "triton_per_channel_a_m_transpose_b_n_transpose",
+        a_k_major=True,
+        b_n_major=False,
+    ),
+    "triton_per_channel_a_k_b_n_tma": PerChannelTmaAdapter(
+        "triton_per_channel_a_k_b_n_tma",
+        b_n_major=True,
+    ),
+    "triton_per_channel_a_k_b_k_tma": PerChannelTmaAdapter(
+        "triton_per_channel_a_k_b_k_tma",
+        b_n_major=False,
+    ),
+    "triton_per_channel_a_k_b_n_transpose_tma": PerChannelTmaAdapter(
+        "triton_per_channel_a_k_b_n_transpose_tma",
+        b_n_major=False,
+    ),
+    "triton_per_channel_a_m_b_n_tma": PerChannelTmaAdapter(
+        "triton_per_channel_a_m_b_n_tma",
+        a_k_major=False,
+        b_n_major=True,
+    ),
+    "triton_per_channel_a_m_transpose_b_n_transpose_tma": PerChannelTmaAdapter(
+        "triton_per_channel_a_m_transpose_b_n_transpose_tma",
+        a_k_major=True,
+        b_n_major=False,
+    ),
+    **{
+        f"triton_per_block_{scheme}_a_k_b_n": PerBlockAdapter(
+            f"triton_per_block_{scheme}_a_k_b_n",
+            b_n_major=True,
+        )
+        for scheme in ("1d", "2d")
+    },
+    **{
+        f"triton_per_block_{scheme}_a_k_b_k": PerBlockAdapter(
+            f"triton_per_block_{scheme}_a_k_b_k",
+            b_n_major=False,
+        )
+        for scheme in ("1d", "2d")
+    },
+    **{
+        f"triton_per_block_{scheme}_a_k_b_n_transpose": PerBlockAdapter(
+            f"triton_per_block_{scheme}_a_k_b_n_transpose",
+            b_n_major=False,
+        )
+        for scheme in ("1d", "2d")
+    },
+    **{
+        f"triton_per_block_{scheme}_a_m_b_n": PerBlockAdapter(
+            f"triton_per_block_{scheme}_a_m_b_n",
+            a_k_major=False,
+            b_n_major=True,
+        )
+        for scheme in ("1d", "2d")
+    },
+    **{
+        f"triton_per_block_{scheme}_a_m_transpose_b_n_transpose": PerBlockAdapter(
+            f"triton_per_block_{scheme}_a_m_transpose_b_n_transpose",
+            a_k_major=True,
+            b_n_major=False,
+        )
+        for scheme in ("1d", "2d")
+    },
+    **{
+        f"triton_per_block_{scheme}_a_k_b_n_tma": PerBlockTmaAdapter(
+            f"triton_per_block_{scheme}_a_k_b_n_tma",
+            b_n_major=True,
+        )
+        for scheme in ("1d", "2d")
+    },
+    **{
+        f"triton_per_block_{scheme}_a_k_b_k_tma": PerBlockTmaAdapter(
+            f"triton_per_block_{scheme}_a_k_b_k_tma",
+            b_n_major=False,
+        )
+        for scheme in ("1d", "2d")
+    },
+    **{
+        f"triton_per_block_{scheme}_a_k_b_n_transpose_tma": PerBlockTmaAdapter(
+            f"triton_per_block_{scheme}_a_k_b_n_transpose_tma",
+            b_n_major=False,
+        )
+        for scheme in ("1d", "2d")
+    },
+    **{
+        f"triton_per_block_{scheme}_a_m_b_n_tma": PerBlockTmaAdapter(
+            f"triton_per_block_{scheme}_a_m_b_n_tma",
+            a_k_major=False,
+            b_n_major=True,
+        )
+        for scheme in ("1d", "2d")
+    },
+    **{
+        f"triton_per_block_{scheme}_a_m_transpose_b_n_transpose_tma": PerBlockTmaAdapter(
+            f"triton_per_block_{scheme}_a_m_transpose_b_n_transpose_tma",
+            a_k_major=True,
+            b_n_major=False,
+        )
+        for scheme in ("1d", "2d")
+    },
 }
 
 

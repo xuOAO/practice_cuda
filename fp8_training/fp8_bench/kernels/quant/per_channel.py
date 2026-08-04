@@ -1,7 +1,106 @@
 from __future__ import annotations
 
+import torch
 import triton
 import triton.language as tl
+
+
+# 融合后的性能不是很好
+@torch.compile
+def fp8_per_channel_quant_torch_compile(
+    x: torch.Tensor,
+    channel_axis: int,
+    fp8_dtype: torch.dtype,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    reduction_dim = -1 if channel_axis == -2 else -2
+    x_safe_amax = torch.amax(
+        torch.abs(x.float()),
+        dim=reduction_dim,
+    ).clamp_min(eps)
+    fp8_max = torch.finfo(fp8_dtype).max
+    quant_scale = fp8_max / x_safe_amax
+    dequant_scale = x_safe_amax / fp8_max
+    output = torch.clamp(
+        x.float() * quant_scale.unsqueeze(reduction_dim),
+        min=-fp8_max,
+        max=fp8_max,
+    ).to(fp8_dtype)
+    return output, dequant_scale
+
+# one-pass的优势不明显，并且对主序要求高，如果行主序，但是按列规约，访存不合并
+# 性能不优势的原因如下：
+#   tl.arange要2的幂，对于N = 640这样的shape，BLOCK_SIZE=1024，会导致大量的无效读
+#   2-pass第二遍读取会命中L2cache，并不完全等价于读HBM
+@triton.jit
+def fp8_per_channel_quant_one_pass_kernel(
+    x_ptr,
+    y_ptr,
+    m,
+    n,
+    stride_xb,
+    stride_xm,
+    stride_xn,
+    stride_yb,
+    stride_ym,
+    stride_yn,
+    dequant_scale_ptr,
+    stride_sb,
+    stride_sx,
+    channel_axis: tl.constexpr,  # -1 or -2
+    fp8_max: tl.constexpr,
+    dim: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    EPS: tl.constexpr,
+):
+    """Quantize one complete channel after loading its values only once."""
+    tl.static_assert(channel_axis == -1 or channel_axis == -2)
+
+    channel = tl.program_id(0)
+    batch = tl.program_id(1)
+    if dim == 3:
+        x_ptr += batch * stride_xb
+        y_ptr += batch * stride_yb
+        dequant_scale_ptr += batch * stride_sb
+
+    reduction_offsets = tl.arange(0, BLOCK_SIZE)
+    if channel_axis == -2:
+        # Each program owns a logical row and reduces across N.
+        reduction_mask = reduction_offsets < n
+        x_offsets = channel * stride_xm + reduction_offsets * stride_xn
+        y_offsets = channel * stride_ym + reduction_offsets * stride_yn
+    else:
+        # Each program owns a logical column and reduces across M.
+        reduction_mask = reduction_offsets < m
+        x_offsets = reduction_offsets * stride_xm + channel * stride_xn
+        y_offsets = reduction_offsets * stride_ym + channel * stride_yn
+
+    # Keep the complete channel live so quantization can reuse it after the
+    # reduction instead of reading it from global memory a second time.
+    x_value = tl.load(
+        x_ptr + x_offsets,
+        mask=reduction_mask,
+        other=0.0,
+    ).to(tl.float32)
+    x_safe_amax = tl.maximum(tl.max(tl.abs(x_value), axis=0), EPS)
+    quant_scale = fp8_max / x_safe_amax
+    dequant_scale = x_safe_amax / fp8_max
+
+    y_value = tl.clamp(
+        x_value * quant_scale,
+        min=-fp8_max,
+        max=fp8_max,
+    ).to(y_ptr.dtype.element_ty)
+    tl.store(
+        y_ptr + y_offsets,
+        y_value,
+        mask=reduction_mask,
+    )
+    tl.store(
+        dequant_scale_ptr + channel * stride_sx,
+        dequant_scale,
+    )
+
 
 @triton.jit
 def fp8_per_channel_quant_kernel(
@@ -168,10 +267,25 @@ def fp8_per_channel_quant_kernel(
             y_block = tl.advance(y_block, (BLOCK_M, 0))
         
 _CONFIGS = [
+    # Row-wise reduction (channel_axis=-2): process a small group of rows
+    # while reducing wider contiguous K chunks.
+    triton.Config({"BLOCK_M": 4, "BLOCK_N": 128}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 8, "BLOCK_N": 128}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 16, "BLOCK_N": 128}, num_warps=4, num_stages=2),
+    # Balanced candidates shared by both reduction directions.
     triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4, num_stages=3),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=2),
+    # Column-wise reduction (channel_axis=-1): reduce taller M chunks while
+    # keeping enough adjacent output channels for coalesced memory traffic.
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_warps=4, num_stages=2),
+    # Higher-warp variants for larger tiles and long reductions.
+    triton.Config({"BLOCK_M": 32, "BLOCK_N": 128}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=8, num_stages=2),
 ]
 
 fp8_per_channel_quant_kernel_autotuned = triton.autotune(
     configs=_CONFIGS,
-    key=["m", "n"],
+    key=["m", "n", "channel_axis", "X_N_MAJOR", "Y_N_MAJOR"],
 )(fp8_per_channel_quant_kernel)
