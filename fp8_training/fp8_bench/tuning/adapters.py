@@ -341,6 +341,16 @@ class PerChannelAdapter(_BaseAdapter):
             b_n_major=b_n_major,
         )
 
+    def _launch_kwargs(
+        self,
+        spec: TuningSpec,
+        config: KernelConfig,
+    ) -> dict[str, Any]:
+        return {
+            **super()._launch_kwargs(spec, config),
+            "SCALES_ARE_QUANT": False,
+        }
+
     def compile(self, spec: TuningSpec, config: KernelConfig) -> Any:
         common = self._compile_common(spec)
         args = (

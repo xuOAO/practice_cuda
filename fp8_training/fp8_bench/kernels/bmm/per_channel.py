@@ -36,6 +36,7 @@ def batch_fp8_per_channel_bmm_kernel(
     USE_BIAS: tl.constexpr,
     A_K_MAJOR: tl.constexpr,
     B_N_MAJOR: tl.constexpr,
+    SCALES_ARE_QUANT: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -91,6 +92,8 @@ def batch_fp8_per_channel_bmm_kernel(
         other=0.0
     ).to(tl.float32)
     dequant_scale = dequant_scale_a[:, None] * dequant_scale_b[None, :]
+    if SCALES_ARE_QUANT:
+        dequant_scale = 1.0 / dequant_scale
 
     accumulator *= dequant_scale
     if USE_BIAS:
@@ -150,6 +153,7 @@ def batch_fp8_per_channel_bmm_tma_kernel(
     USE_BIAS: tl.constexpr,
     A_K_MAJOR: tl.constexpr,
     B_N_MAJOR: tl.constexpr,
+    SCALES_ARE_QUANT: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -227,6 +231,8 @@ def batch_fp8_per_channel_bmm_tma_kernel(
         other=0.0
     ).to(tl.float32)
     dequant_scale = dequant_scale_a[:, None] * dequant_scale_b[None, :]
+    if SCALES_ARE_QUANT:
+        dequant_scale = 1.0 / dequant_scale
 
     accumulator *= dequant_scale
     if USE_BIAS:

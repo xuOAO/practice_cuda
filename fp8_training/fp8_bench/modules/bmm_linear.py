@@ -8,10 +8,14 @@ import torch
 import torch.nn as nn
 import triton
 
+from fp8_bench.kernels.bmm.per_channel import (
+    batch_fp8_per_channel_bmm_tma_kernel_autotuned,
+)
 from fp8_bench.kernels.bmm.per_tensor import (
     batch_fp8_per_tensor_bmm_tma_kernel_autotuned,
 )
 from fp8_bench.modules.float8.config import (
+    CastConfig,
     Float8LinearConfig,
     ScalingGranularity,
     ScalingType,
@@ -27,7 +31,7 @@ from fp8_bench.modules.float8.float8_training_tensor import (
     GemmInputRole,
     LinearMMConfig,
 )
-from fp8_bench.modules.float8.float8_utils import EPS
+from fp8_bench.modules.float8.float8_utils import EPS, tensor_to_scale
 from fp8_bench.modules.float8.fsdp_utils import (
     WeightWithDynamicFloat8CastTensor,
 )
@@ -37,10 +41,12 @@ from fp8_bench.modules.float8.fsdp_utils import (
 class Float8BMMLinearConfig(Float8LinearConfig):
     """torchAO-compatible configuration for :class:`Float8BMMLinear`.
 
-    The BMM TMA backend currently supports dynamic tensorwise scaling only.
+    The BMM TMA backend supports dynamic tensorwise and axiswise scaling.
     torchAO's default mixed-dtype recipe is retained: input and weight use
     E4M3, while grad-output uses E5M2.
     """
+
+    supports_axiswise_fsdp_float8_all_gather = True
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -54,19 +60,26 @@ class Float8BMMLinearConfig(Float8LinearConfig):
                 self.cast_config_grad_output_for_grad_weight
             ),
         }
+        granularities = set()
         for name, cast_config in cast_configs.items():
             if cast_config.scaling_type is not ScalingType.DYNAMIC:
                 raise ValueError(
                     f"Float8BMMLinear requires dynamic FP8 casting for {name}"
                 )
-            if (
-                cast_config.scaling_granularity
-                is not ScalingGranularity.TENSORWISE
-            ):
+            if cast_config.scaling_granularity not in {
+                ScalingGranularity.TENSORWISE,
+                ScalingGranularity.AXISWISE,
+            }:
                 raise ValueError(
-                    "Float8BMMLinear's TMA backend requires tensorwise scaling "
+                    "Float8BMMLinear's TMA backend does not support scaling "
                     f"for {name}"
                 )
+            granularities.add(cast_config.scaling_granularity)
+        if len(granularities) != 1:
+            raise ValueError(
+                "Float8BMMLinear requires all six cast configs to use the "
+                "same scaling granularity"
+            )
         if self.emulate:
             raise ValueError("Float8BMMLinear does not support emulation")
 
@@ -117,6 +130,7 @@ def _bmm_linear_tma_op(
     bias: torch.Tensor,
     use_bias: bool,
     output_dtype: torch.dtype,
+    per_channel: bool,
 ) -> torch.Tensor:
     # Triton's allocator is a ContextVar. Backward may run on an autograd
     # worker thread, so install it in the actual launch context as well.
@@ -146,30 +160,70 @@ def _bmm_linear_tma_op(
             batch,
         )
 
-    torch.library.wrap_triton(
-        batch_fp8_per_tensor_bmm_tma_kernel_autotuned
-    )[grid](
-        a,
-        b,
-        output,
-        bias,
-        scale_a,
-        scale_b,
-        m,
-        n,
-        k,
-        *a.stride(),
-        *b.stride(),
-        *output.stride(),
-        stride_biasb,
-        stride_biasm,
-        stride_biasn,
-        USE_BIAS=use_bias,
-        A_K_MAJOR=a_k_major,
-        B_N_MAJOR=b_n_major,
-        SCALES_ARE_QUANT=True,
-        ACTIVATION="none",
-    )
+    if per_channel:
+        if scale_a.numel() == 1:
+            stride_scale_ab = stride_scale_ax = 0
+        else:
+            scale_a = scale_a.reshape(batch, m)
+            stride_scale_ab, stride_scale_ax = scale_a.stride()
+        if scale_b.numel() == 1:
+            stride_scale_bb = stride_scale_bx = 0
+        else:
+            scale_b = scale_b.reshape(batch, n)
+            stride_scale_bb, stride_scale_bx = scale_b.stride()
+        torch.library.wrap_triton(
+            batch_fp8_per_channel_bmm_tma_kernel_autotuned
+        )[grid](
+            a,
+            b,
+            output,
+            bias,
+            scale_a,
+            scale_b,
+            m,
+            n,
+            k,
+            *a.stride(),
+            *b.stride(),
+            *output.stride(),
+            stride_biasb,
+            stride_biasm,
+            stride_biasn,
+            stride_scale_ab,
+            stride_scale_ax,
+            stride_scale_bb,
+            stride_scale_bx,
+            USE_BIAS=use_bias,
+            A_K_MAJOR=a_k_major,
+            B_N_MAJOR=b_n_major,
+            SCALES_ARE_QUANT=True,
+            ACTIVATION="none",
+        )
+    else:
+        torch.library.wrap_triton(
+            batch_fp8_per_tensor_bmm_tma_kernel_autotuned
+        )[grid](
+            a,
+            b,
+            output,
+            bias,
+            scale_a,
+            scale_b,
+            m,
+            n,
+            k,
+            *a.stride(),
+            *b.stride(),
+            *output.stride(),
+            stride_biasb,
+            stride_biasm,
+            stride_biasn,
+            USE_BIAS=use_bias,
+            A_K_MAJOR=a_k_major,
+            B_N_MAJOR=b_n_major,
+            SCALES_ARE_QUANT=True,
+            ACTIVATION="none",
+        )
     return output
 
 
@@ -196,11 +250,23 @@ def _fp8_bmm_tma(
         raise ValueError(
             "Float8 BMM operands must be CUDA tensors on the same device"
         )
-    if a_scale.numel() != 1 or b_scale.numel() != 1:
-        raise ValueError("Float8BMMLinear only supports per-tensor scales")
-
     batch = a_data.shape[0]
+    m = a_data.shape[1]
     n = b_data.shape[2]
+    per_channel = a_scale.numel() != 1 or b_scale.numel() != 1
+    if per_channel:
+        valid_a_shapes = {(batch, m), (batch, m, 1)}
+        valid_b_shapes = {(batch, n), (batch, n, 1)}
+        if a_scale.numel() != 1 and tuple(a_scale.shape) not in valid_a_shapes:
+            raise ValueError(
+                f"A per-channel scale must have shape [B,M] or [B,M,1], "
+                f"got {tuple(a_scale.shape)}"
+            )
+        if b_scale.numel() != 1 and tuple(b_scale.shape) not in valid_b_shapes:
+            raise ValueError(
+                f"B per-channel scale must have shape [B,N] or [B,N,1], "
+                f"got {tuple(b_scale.shape)}"
+            )
     if bias is None:
         bias_arg = a_data
         use_bias = False
@@ -220,15 +286,17 @@ def _fp8_bmm_tma(
         bias_arg,
         use_bias,
         output_dtype,
+        per_channel,
     )
 
 
 def _to_float8(
     tensor: torch.Tensor,
-    target_dtype: torch.dtype,
+    cast_config: CastConfig,
     linear_mm_config: LinearMMConfig,
     role: GemmInputRole,
     round_scales_to_power_of_2: bool,
+    axiswise_dim: int = -1,
 ) -> Float8TrainingTensor:
     if tensor_already_casted_to_fp8(tensor):
         if not isinstance(tensor, Float8TrainingTensor):
@@ -239,10 +307,15 @@ def _to_float8(
         return tensor
     result = hp_tensor_to_float8_dynamic(
         tensor,
-        target_dtype,
+        cast_config.target_dtype,
         linear_mm_config,
         gemm_input_role=role,
-        scaling_granularity=ScalingGranularity.TENSORWISE,
+        scaling_granularity=cast_config.scaling_granularity,
+        axiswise_dim=(
+            axiswise_dim
+            if cast_config.scaling_granularity is ScalingGranularity.AXISWISE
+            else None
+        ),
         round_scales_to_power_of_2=round_scales_to_power_of_2,
     )
     if not isinstance(result, Float8TrainingTensor):
@@ -263,14 +336,14 @@ class _Float8BMMLinearFunction(torch.autograd.Function):
     ) -> torch.Tensor:
         input_fp8 = _to_float8(
             input,
-            config.cast_config_input.target_dtype,
+            config.cast_config_input,
             linear_mm_config,
             GemmInputRole.INPUT,
             config.round_scales_to_power_of_2,
         )
         weight_fp8 = _to_float8(
             weight,
-            config.cast_config_weight.target_dtype,
+            config.cast_config_weight,
             linear_mm_config,
             GemmInputRole.WEIGHT,
             config.round_scales_to_power_of_2,
@@ -294,13 +367,37 @@ class _Float8BMMLinearFunction(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):
         input_fp8, weight_fp8 = ctx.saved_tensors
         config = ctx.config
-        grad_output_fp8 = _to_float8(
-            grad_output,
-            config.cast_config_grad_output.target_dtype,
-            ctx.linear_mm_config,
-            GemmInputRole.GRAD_OUTPUT,
-            config.round_scales_to_power_of_2,
+        per_channel = (
+            config.cast_config_input.scaling_granularity
+            is ScalingGranularity.AXISWISE
         )
+
+        if per_channel:
+            # The forward rowwise weight scale becomes a reduction-dimension
+            # scale in dX. Fold it into dY before quantization so the same
+            # all-gathered FP8 weight can be reused without a second payload.
+            weight_scale = weight_fp8._scale.reshape(
+                weight_fp8.shape[0], weight_fp8.shape[1]
+            )
+            grad_output_for_grad_input = (
+                grad_output.to(torch.float32) / weight_scale.unsqueeze(1)
+            )
+            grad_output_fp8 = _to_float8(
+                grad_output_for_grad_input,
+                config.cast_config_grad_output,
+                ctx.linear_mm_config,
+                GemmInputRole.GRAD_OUTPUT,
+                config.round_scales_to_power_of_2,
+            )
+            folded_scale = weight_scale.new_ones(())
+        else:
+            grad_output_fp8 = _to_float8(
+                grad_output,
+                config.cast_config_grad_output,
+                ctx.linear_mm_config,
+                GemmInputRole.GRAD_OUTPUT,
+                config.round_scales_to_power_of_2,
+            )
 
         grad_input = None
         if ctx.needs_input_grad[0]:
@@ -308,25 +405,43 @@ class _Float8BMMLinearFunction(torch.autograd.Function):
             grad_input = _fp8_bmm_tma(
                 grad_output_fp8,
                 weight_fp8._data,
-                weight_fp8._scale,
+                folded_scale if per_channel else weight_fp8._scale,
                 grad_output.dtype,
             )
 
         grad_weight = None
         if ctx.needs_input_grad[1]:
-            # dW = dY.T @ X. Both are views into already-quantized tensors;
-            # TMA consumes A_M_MAJOR/B_N_MAJOR directly without packing.
-            grad_output_t = Float8TrainingTensor(
-                grad_output_fp8._data.transpose(-2, -1),
-                grad_output_fp8._scale,
-                grad_output_fp8._orig_dtype,
-                ctx.linear_mm_config,
-                GemmInputRole.GRAD_OUTPUT,
-            )
+            if per_channel:
+                # Likewise fold X's forward row scale into dY.T. This reuses
+                # the saved FP8 input for dW and keeps only one FP8 copy.
+                input_scale = input_fp8._scale.reshape(
+                    input_fp8.shape[0], input_fp8.shape[1]
+                )
+                grad_output_t_hp = grad_output.transpose(-2, -1).to(
+                    torch.float32
+                ) / input_scale.unsqueeze(1)
+                grad_output_t = _to_float8(
+                    grad_output_t_hp,
+                    config.cast_config_grad_output_for_grad_weight,
+                    ctx.linear_mm_config,
+                    GemmInputRole.GRAD_OUTPUT,
+                    config.round_scales_to_power_of_2,
+                )
+                input_b_scale = folded_scale
+            else:
+                # Tensorwise scales survive transposition unchanged.
+                grad_output_t = Float8TrainingTensor(
+                    grad_output_fp8._data.transpose(-2, -1),
+                    grad_output_fp8._scale,
+                    grad_output_fp8._orig_dtype,
+                    ctx.linear_mm_config,
+                    GemmInputRole.GRAD_OUTPUT,
+                )
+                input_b_scale = input_fp8._scale
             grad_weight = _fp8_bmm_tma(
                 grad_output_t,
                 input_fp8._data,
-                input_fp8._scale,
+                input_b_scale,
                 grad_output.dtype,
             )
 
@@ -446,6 +561,15 @@ class Float8BMMLinear(nn.Module):
                     self.weight,
                     self.linear_mm_config,
                     self.config.cast_config_weight.target_dtype,
+                    scaling_granularity=(
+                        self.config.cast_config_weight.scaling_granularity
+                    ),
+                    axiswise_dim=(
+                        -1
+                        if self.config.cast_config_weight.scaling_granularity
+                        is ScalingGranularity.AXISWISE
+                        else None
+                    ),
                 ),
                 requires_grad=self.weight.requires_grad,
             )
@@ -479,10 +603,16 @@ class Float8BMMLinear(nn.Module):
         )
 
     def extra_repr(self) -> str:
+        backend = (
+            "triton_per_channel_tma"
+            if self.config.cast_config_input.scaling_granularity
+            is ScalingGranularity.AXISWISE
+            else "triton_per_tensor_tma"
+        )
         return (
             f"batch_size={self.batch_size}, in_features={self.in_features}, "
             f"out_features={self.out_features}, bias={self.bias is not None}, "
-            "backend=triton_per_tensor_tma, "
+            f"backend={backend}, "
             f"fp8_all_gather={self.config.enable_fsdp_float8_all_gather}"
         )
 
@@ -513,6 +643,15 @@ class Float8BMMLinear(nn.Module):
                     converted.weight,
                     converted.linear_mm_config,
                     config.cast_config_weight.target_dtype,
+                    scaling_granularity=(
+                        config.cast_config_weight.scaling_granularity
+                    ),
+                    axiswise_dim=(
+                        -1
+                        if config.cast_config_weight.scaling_granularity
+                        is ScalingGranularity.AXISWISE
+                        else None
+                    ),
                 ),
                 requires_grad=converted.weight.requires_grad,
             )
@@ -554,6 +693,39 @@ def precompute_bmm_float8_dynamic_scale_for_fsdp(module: nn.Module) -> None:
         )
     ]
     if not bmm_linears:
+        return
+
+    granularity = bmm_linears[0].config.cast_config_weight.scaling_granularity
+    if any(
+        child.config.cast_config_weight.scaling_granularity is not granularity
+        for child in bmm_linears
+    ):
+        raise ValueError(
+            "precomputed FP8 weight scales require one shared granularity"
+        )
+
+    if granularity is ScalingGranularity.AXISWISE:
+        for child in bmm_linears:
+            # BMM weights are [B,N,K], and FSDP shards dim 0. Every [N,K]
+            # matrix therefore remains local, so its row scales need no DP
+            # all-reduce and are gathered alongside the FP8 data later.
+            if any(
+                getattr(placement, "dim", 0) != 0
+                for placement in child.weight.placements
+            ):
+                raise NotImplementedError(
+                    "per-channel BMM scale precompute requires FSDP Shard(0)"
+                )
+            local_weight = child.weight._local_tensor
+            local_weight._precomputed_scale = tensor_to_scale(
+                local_weight._tensor,
+                child.config.cast_config_weight.target_dtype,
+                scaling_granularity=ScalingGranularity.AXISWISE,
+                axiswise_dim=-1,
+                round_scales_to_power_of_2=(
+                    child.config.round_scales_to_power_of_2
+                ),
+            )
         return
 
     target_dtypes = {

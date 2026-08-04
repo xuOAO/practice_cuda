@@ -118,7 +118,6 @@ def implements(aten_ops):
 @implements(
     [
         aten._unsafe_view.default,
-        aten.as_strided.default,
         aten.clone.default,
         aten.slice.Tensor,
         aten.fill_.Scalar,
@@ -137,6 +136,45 @@ def float8_desugar_op(aten_op, args, kwargs=None):
     )
 
 
+@implements([aten.as_strided.default])
+def float8_as_strided(aten_op, args, kwargs=None):
+    tensor = args[0]
+    new_data = aten_op(tensor._data, *args[1:], **kwargs)
+    if tensor._axiswise_dim is None:
+        new_scale = tensor._scale
+    else:
+        # FSDP2 reconstructs an unpadded parameter with as_strided after the
+        # extension all-gathers a padded dim-0 shard. For rowwise BMM weights,
+        # crop the gathered [padded_B,N,1] scale to the logical data shape.
+        if tensor._axiswise_dim != -1:
+            raise NotImplementedError(
+                "Float8TrainingTensor.as_strided only supports axiswise_dim=-1"
+            )
+        storage_offset = (
+            args[3]
+            if len(args) > 3
+            else (kwargs or {}).get("storage_offset", 0)
+        )
+        if (
+            storage_offset not in (None, 0)
+            or new_data.shape[-1] != tensor.shape[-1]
+        ):
+            raise NotImplementedError(
+                "axiswise as_strided only supports zero-offset leading-dimension crops"
+            )
+        scale_shape = (*new_data.shape[:-1], 1)
+        slices = tuple(slice(0, size) for size in scale_shape)
+        new_scale = tensor._scale[slices]
+    return Float8TrainingTensor(
+        new_data,
+        new_scale,
+        tensor._orig_dtype,
+        tensor._linear_mm_config,
+        tensor._gemm_input_role,
+        tensor._axiswise_dim,
+    )
+
+
 @implements(
     [
         aten.detach.default,
@@ -151,6 +189,7 @@ def float8_desugar_data_and_scale_op(aten_op, args, kwargs=None):
         args[0]._orig_dtype,
         args[0]._linear_mm_config,
         args[0]._gemm_input_role,
+        args[0]._axiswise_dim,
     )
 
 

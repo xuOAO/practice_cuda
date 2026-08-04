@@ -420,6 +420,7 @@ def triton_per_channel_bmm(
         USE_BIAS=bias is not None,
         A_K_MAJOR=a_k_major,
         B_N_MAJOR=b_n_major,
+        SCALES_ARE_QUANT=False,
         ACTIVATION=activation,
         **launch_kwargs,
     )

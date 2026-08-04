@@ -245,6 +245,10 @@ class Float8LinearConfig:
     # same value in the forward pass as the backward passes.
     round_scales_to_power_of_2: bool = False
 
+    # Tensor subclasses used by specialized modules may override this class
+    # attribute when their FSDP all-gather extension carries axiswise scales.
+    supports_axiswise_fsdp_float8_all_gather = False
+
     def __post_init__(self):
         # Populate the additional cast overrides, if the user did not specify them
         # Note: this hacks around the frozen-ness of this dataclass
@@ -267,8 +271,13 @@ class Float8LinearConfig:
                 self.cast_config_grad_output,
             )
 
-        # float8 all-gather only supports tensorwise, in the future may support blockwise
-        if self.cast_config_weight.scaling_granularity != ScalingGranularity.TENSORWISE:
+        # Generic Float8Linear all-gather only supports tensorwise scaling.
+        # Specialized subclasses may provide an axiswise-capable extension.
+        if (
+            self.cast_config_weight.scaling_granularity
+            != ScalingGranularity.TENSORWISE
+            and not self.supports_axiswise_fsdp_float8_all_gather
+        ):
             assert not self.enable_fsdp_float8_all_gather, (
                 f"enable_fsdp_float8_all_gather only supports tensorwise scaling granularity, got {self.cast_config_weight.scaling_granularity}"
             )

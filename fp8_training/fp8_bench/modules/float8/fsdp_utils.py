@@ -15,6 +15,7 @@ from torch._prims_common import suggest_memory_format
 from .float8_scaling_utils import (
     hp_tensor_to_float8_dynamic,
 )
+from .config import ScalingGranularity
 from .float8_training_tensor import (
     Float8TrainingTensor,
     GemmInputRole,
@@ -144,6 +145,9 @@ class WeightWithDynamicFloat8CastTensor(torch.Tensor):
         linear_mm_config: LinearMMConfig,
         dtype: torch.dtype,
         precomputed_scale: Optional[torch.Tensor] = None,
+        scaling_granularity: ScalingGranularity = ScalingGranularity.TENSORWISE,
+        axiswise_dim: Optional[int] = None,
+        fsdp_global_shape: Optional[torch.Size] = None,
     ):
         return torch.Tensor._make_wrapper_subclass(
             cls,
@@ -164,10 +168,18 @@ class WeightWithDynamicFloat8CastTensor(torch.Tensor):
         linear_mm_config: LinearMMConfig,
         dtype: torch.dtype,
         precomputed_scale: Optional[torch.Tensor] = None,
+        scaling_granularity: ScalingGranularity = ScalingGranularity.TENSORWISE,
+        axiswise_dim: Optional[int] = None,
+        fsdp_global_shape: Optional[torch.Size] = None,
     ):
         self._tensor = tensor
         self._linear_mm_config = linear_mm_config
         self._dtype = dtype
+        self._scaling_granularity = scaling_granularity
+        self._axiswise_dim = axiswise_dim
+        self._fsdp_global_shape = (
+            tensor.shape if fsdp_global_shape is None else fsdp_global_shape
+        )
         # for dynamic scaling
         # `precompute_float8_dynamic_scale_for_fsdp` calculates scales
         # for all float8 parameters after optimizer step
@@ -177,13 +189,21 @@ class WeightWithDynamicFloat8CastTensor(torch.Tensor):
     def __torch_dispatch__(cls, func, types, args, kwargs=None):
         if func == torch.ops.aten.detach.default:
             return WeightWithDynamicFloat8CastTensor(
-                args[0]._tensor, args[0]._linear_mm_config, args[0]._dtype
+                args[0]._tensor,
+                args[0]._linear_mm_config,
+                args[0]._dtype,
+                scaling_granularity=args[0]._scaling_granularity,
+                axiswise_dim=args[0]._axiswise_dim,
+                fsdp_global_shape=args[0]._fsdp_global_shape,
             )
         mm_config: Optional[LinearMMConfig] = None
         dtype: Optional[torch.dtype] = None
+        scaling_granularity: Optional[ScalingGranularity] = None
+        axiswise_dim: Optional[int] = None
+        fsdp_global_shape: Optional[torch.Size] = None
 
         def unwrap(t):
-            nonlocal mm_config
+            nonlocal mm_config, scaling_granularity, axiswise_dim, fsdp_global_shape
             if mm_config is None:
                 mm_config = t._linear_mm_config
             else:
@@ -193,6 +213,13 @@ class WeightWithDynamicFloat8CastTensor(torch.Tensor):
                 dtype = t._dtype
             else:
                 assert t._dtype == dtype
+            if scaling_granularity is None:
+                scaling_granularity = t._scaling_granularity
+                axiswise_dim = t._axiswise_dim
+                fsdp_global_shape = t._fsdp_global_shape
+            else:
+                assert t._scaling_granularity == scaling_granularity
+                assert t._axiswise_dim == axiswise_dim
             return t._tensor
 
         args, kwargs = pytree.tree_map_only(
@@ -203,7 +230,14 @@ class WeightWithDynamicFloat8CastTensor(torch.Tensor):
             return out
         return pytree.tree_map_only(
             torch.Tensor,
-            lambda x: WeightWithDynamicFloat8CastTensor(x, mm_config, dtype),
+            lambda x: WeightWithDynamicFloat8CastTensor(
+                x,
+                mm_config,
+                dtype,
+                scaling_granularity=scaling_granularity,
+                axiswise_dim=axiswise_dim,
+                fsdp_global_shape=fsdp_global_shape,
+            ),
             out,
         )
 
@@ -211,7 +245,13 @@ class WeightWithDynamicFloat8CastTensor(torch.Tensor):
         tensors = ["_tensor"]
         if self._precomputed_scale is not None:
             tensors.append("_precomputed_scale")
-        return tensors, {"mm_config": self._linear_mm_config, "dtype": self._dtype}
+        return tensors, {
+            "mm_config": self._linear_mm_config,
+            "dtype": self._dtype,
+            "scaling_granularity": self._scaling_granularity,
+            "axiswise_dim": self._axiswise_dim,
+            "fsdp_global_shape": self._fsdp_global_shape,
+        }
 
     @staticmethod
     def __tensor_unflatten__(inner_tensors, flatten_spec, outer_size, outer_stride):
@@ -220,6 +260,9 @@ class WeightWithDynamicFloat8CastTensor(torch.Tensor):
             flatten_spec["mm_config"],
             flatten_spec["dtype"],
             inner_tensors.get("_precomputed_scale"),
+            flatten_spec["scaling_granularity"],
+            flatten_spec["axiswise_dim"],
+            flatten_spec["fsdp_global_shape"],
         )
 
     def __repr__(self):
@@ -230,25 +273,66 @@ class WeightWithDynamicFloat8CastTensor(torch.Tensor):
         # `precompute_float8_dynamic_scale_for_fsdp` between iterations, and
         # under free-threaded CPython we must not read the attribute twice in
         # the if/use pair.
+        tensor = self._tensor
         precomputed_scale = self._precomputed_scale
+        if self._scaling_granularity is ScalingGranularity.AXISWISE:
+            # FSDP may expose uneven dim-0 shards to extensions. Collectives
+            # require equal input sizes, so pad to ceil(global_B / world_size)
+            # and let FSDP's post-all-gather as_strided crop the final tensor.
+            padded_rows = math.ceil(self._fsdp_global_shape[0] / mesh.size())
+            pad_rows = padded_rows - tensor.shape[0]
+            if pad_rows > 0:
+                tensor = torch.cat(
+                    (
+                        tensor,
+                        tensor.new_zeros((pad_rows, *tensor.shape[1:])),
+                    ),
+                    dim=0,
+                )
+                if precomputed_scale is not None:
+                    precomputed_scale = torch.cat(
+                        (
+                            precomputed_scale,
+                            precomputed_scale.new_ones(
+                                (pad_rows, *precomputed_scale.shape[1:])
+                            ),
+                        ),
+                        dim=0,
+                    )
         if precomputed_scale is not None:
             float8_training_tensor = hp_tensor_and_scale_to_float8(
-                self._tensor,
+                tensor,
                 precomputed_scale,
                 self._dtype,
                 self._linear_mm_config,
                 GemmInputRole.WEIGHT,
+                self._axiswise_dim,
             )
         else:
             float8_training_tensor = hp_tensor_to_float8_dynamic(
-                self._tensor,
+                tensor,
                 self._dtype,
                 self._linear_mm_config,
-                reduce_amax=True,
+                reduce_amax=(
+                    self._scaling_granularity
+                    is ScalingGranularity.TENSORWISE
+                ),
                 gemm_input_role=GemmInputRole.WEIGHT,
                 device_mesh=mesh,
+                scaling_granularity=self._scaling_granularity,
+                axiswise_dim=self._axiswise_dim,
             )
-        return (float8_training_tensor._data,), (float8_training_tensor._scale,)
+        if self._scaling_granularity is ScalingGranularity.AXISWISE:
+            # Unlike a tensorwise scalar, channel scales differ on every DP
+            # rank and must participate in the all-gather payload.
+            return (
+                float8_training_tensor._data,
+                float8_training_tensor._scale,
+            ), {"axiswise_dim": self._axiswise_dim}
+        return (float8_training_tensor._data,), {
+            "scale": float8_training_tensor._scale,
+            "axiswise_dim": None,
+        }
 
     def fsdp_post_all_gather(
         self,
@@ -258,17 +342,38 @@ class WeightWithDynamicFloat8CastTensor(torch.Tensor):
         *,
         out: Optional[torch.Tensor] = None,
     ):
-        (data,) = all_gather_outputs
-        (scale,) = metadata
+        axiswise_dim = metadata["axiswise_dim"]
+        if axiswise_dim is None:
+            (data,) = all_gather_outputs
+            scale = metadata["scale"]
+            inner_tensors = (data,)
+        else:
+            data, scale = all_gather_outputs
+            inner_tensors = (data, scale)
+
+        def scale_for_data_shape(data_shape):
+            if axiswise_dim is None:
+                return scale
+            if axiswise_dim != -1:
+                raise NotImplementedError(
+                    "FSDP FP8 all-gather currently supports axiswise_dim=-1"
+                )
+            scale_shape = (*data_shape[:-1], 1)
+            slices = tuple(slice(0, size) for size in scale_shape)
+            return scale[slices]
+
         if out is not None:
             from torch.distributed._tensor import DTensor
 
             if isinstance(out, Float8TrainingTensor):
-                out._scale = scale
+                out._scale = scale_for_data_shape(out._data.shape)
+                out._axiswise_dim = axiswise_dim
             elif isinstance(out, DTensor) and isinstance(
                 out._local_tensor, Float8TrainingTensor
             ):
-                out._local_tensor._scale = scale
+                local_out = out._local_tensor
+                local_out._scale = scale_for_data_shape(local_out._data.shape)
+                local_out._axiswise_dim = axiswise_dim
             else:
                 raise RuntimeError(
                     f"out must be a Float8TrainingTensor or DTensor(_local_tensor=Float8TrainingTensor), but got {out}"
@@ -280,7 +385,8 @@ class WeightWithDynamicFloat8CastTensor(torch.Tensor):
             param_dtype,
             self._linear_mm_config,
             gemm_input_role=GemmInputRole.WEIGHT,
-        ), (data,)
+            axiswise_dim=axiswise_dim,
+        ), inner_tensors
 
 
 # Needed to allowlist this subclass for deserialization used for restoring checkpoints.

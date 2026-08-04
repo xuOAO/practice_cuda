@@ -21,11 +21,12 @@ from fp8_bench.modules.bmm_linear import (
     convert_to_float8_bmm_training,
     precompute_bmm_float8_dynamic_scale_for_fsdp,
 )
+from fp8_bench.modules.float8.config import CastConfig, ScalingGranularity
 
 BATCH = 32
 SEQUANCE = 100
 D_MODEL, D_FF = 4096, 4096 * 2
-ITERS = 5
+ITERS = 10
 RANK = None
 WORLD_SIZE = None
 DEVICE = None
@@ -51,10 +52,10 @@ def setup():
 
 
 class MLPModule(torch.nn.Module):
-    def __init__(self, d_model, d_ff):
+    def __init__(self, batch_size, d_model, d_ff):
         super().__init__()
-        self.linear1 = BMMLinear(BATCH, d_model, d_ff)
-        self.linear2 = BMMLinear(BATCH, d_ff, d_model)
+        self.linear1 = BMMLinear(batch_size, d_model, d_ff)
+        self.linear2 = BMMLinear(batch_size, d_ff, d_model)
         self.activation = torch.nn.ReLU()
 
     def forward(self, x):
@@ -65,10 +66,13 @@ class MLPModule(torch.nn.Module):
 
 
 class ToyModule(torch.nn.Module):
-    def __init__(self, num_block: int = 32):
+    def __init__(self, batch_size, d_model, d_ff, num_block: int = 32):
         super().__init__()
         self.blocks = torch.nn.ModuleList(
-            [MLPModule(D_MODEL, D_FF) for _ in range(num_block)]
+            [
+                MLPModule(batch_size, d_model, d_ff)
+                for _ in range(num_block)
+            ]
         )
 
     def forward(self, x):
@@ -104,6 +108,12 @@ def parse_args():
         help="Use precomputed scales for FP8 training test",
     )
     parser.add_argument(
+        "--scaling-granularity",
+        choices=("per-tensor", "per-channel"),
+        default="per-tensor",
+        help="FP8 scaling recipe used by all three training BMMs",
+    )
+    parser.add_argument(
         "--profile",
         action="store_true",
         help="Capture a steady-state rank-0 CPU/CUDA profiler trace",
@@ -118,6 +128,13 @@ def parse_args():
         default="traces/bmm_fsdp2",
         help="Directory in which profiler traces are written",
     )
+    parser.add_argument("--batch-size", type=int, default=BATCH)
+    parser.add_argument("--sequence-length", type=int, default=SEQUANCE)
+    parser.add_argument("--d-model", type=int, default=D_MODEL)
+    parser.add_argument("--d-ff", type=int, default=D_FF)
+    parser.add_argument("--num-blocks", type=int, default=2)
+    parser.add_argument("--warmup", type=int, default=WARMUP)
+    parser.add_argument("--iters", type=int, default=ITERS)
     return parser.parse_args()
 
 
@@ -183,13 +200,29 @@ def main():
     setup()
     torch.manual_seed(42)
 
-    model = ToyModule(num_block=2).to(
+    model = ToyModule(
+        args.batch_size,
+        args.d_model,
+        args.d_ff,
+        num_block=args.num_blocks,
+    ).to(
         device=DEVICE,
         dtype=torch.bfloat16,
     )
     if args.use_fp8:
+        granularity = (
+            ScalingGranularity.AXISWISE
+            if args.scaling_granularity == "per-channel"
+            else ScalingGranularity.TENSORWISE
+        )
         fp8_config = Float8BMMLinearConfig(
+            cast_config_input=CastConfig(scaling_granularity=granularity),
+            cast_config_weight=CastConfig(scaling_granularity=granularity),
+            cast_config_grad_output=CastConfig(scaling_granularity=granularity),
             enable_fsdp_float8_all_gather=True,
+            round_scales_to_power_of_2=(
+                granularity is ScalingGranularity.AXISWISE
+            ),
         )
         model = convert_to_float8_bmm_training(model, config=fp8_config)
 
@@ -218,9 +251,9 @@ def main():
             precompute_bmm_float8_dynamic_scale_for_fsdp(model)
         )
     x = torch.randn(
-        BATCH,
-        SEQUANCE,
-        D_MODEL,
+        args.batch_size,
+        args.sequence_length,
+        args.d_model,
         device=DEVICE,
         dtype=torch.bfloat16,
     )
@@ -229,7 +262,7 @@ def main():
     if args.use_torch_compile:
         real_train_step = torch.compile(train_step, backend="inductor")
 
-    for _ in range(WARMUP):
+    for _ in range(args.warmup):
         loss = real_train_step(model, optimizer, x)
 
     torch.cuda.synchronize(DEVICE)
@@ -256,7 +289,7 @@ def main():
     dist.barrier()
     st = time.perf_counter()
 
-    for step in range(ITERS):
+    for step in range(args.iters):
         loss = real_train_step(model, optimizer, x)
 
     torch.cuda.synchronize(DEVICE)
@@ -273,7 +306,10 @@ def main():
 
     if RANK == 0:
         print(f"Peak memory allocated: {peak_allocated / gb:.2f} GB")
-        print(f"Total time for {ITERS} iterations: {e2e_time:.2f} seconds")
+        print(
+            f"Total time for {args.iters} iterations: "
+            f"{e2e_time:.2f} seconds"
+        )
 
 
 if __name__ == "__main__":
