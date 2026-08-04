@@ -106,7 +106,8 @@ def batch_fp8_per_tensor_bmm_tma_kernel(
     b_ptr,
     c_ptr,
     bias_ptr,
-    scale_ptr,
+    scale_a_ptr,
+    scale_b_ptr,
     m,
     n,
     k,
@@ -125,6 +126,7 @@ def batch_fp8_per_tensor_bmm_tma_kernel(
     USE_BIAS: tl.constexpr,
     A_K_MAJOR: tl.constexpr,
     B_N_MAJOR: tl.constexpr,
+    SCALES_ARE_QUANT: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -191,7 +193,15 @@ def batch_fp8_per_tensor_bmm_tma_kernel(
             b = tl.trans(b_desc.load([pid_n * BLOCK_N, kk]))
         accumulator = tl.dot(a, b, accumulator)
 
-    accumulator *= tl.load(scale_ptr)
+    if SCALES_ARE_QUANT:
+        # torchAO quantizes with q = fp8(x * scale), so the accumulated FP8
+        # product is dequantized by 1 / (scale_a * scale_b). Keeping this in
+        # the BMM avoids a separate scalar GPU kernel before every GEMM.
+        accumulator *= 1.0 / (tl.load(scale_a_ptr) * tl.load(scale_b_ptr))
+    else:
+        # Benchmark/registry callers already provide one combined dequant
+        # scale. scale_b_ptr is unused in this mode.
+        accumulator *= tl.load(scale_a_ptr)
     if USE_BIAS:
         bias_block = tl.make_block_ptr(
             base=bias_ptr + batch * stride_biasb,
@@ -370,5 +380,14 @@ batch_fp8_per_tensor_bmm_kernel_autotuned = triton.autotune(
 
 batch_fp8_per_tensor_bmm_tma_kernel_autotuned = triton.autotune(
     configs=_TMA_CONFIGS,
-    key=["m", "n", "k", "A_K_MAJOR", "B_N_MAJOR", "USE_BIAS", "ACTIVATION"],
+    key=[
+        "m",
+        "n",
+        "k",
+        "A_K_MAJOR",
+        "B_N_MAJOR",
+        "SCALES_ARE_QUANT",
+        "USE_BIAS",
+        "ACTIVATION",
+    ],
 )(batch_fp8_per_tensor_bmm_tma_kernel)

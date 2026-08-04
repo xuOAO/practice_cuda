@@ -563,6 +563,56 @@ class PerTensorTmaAdapter(PerTensorAdapter):
         _assert_tma_aligned(spec, self.a_k_major, self.b_n_major)
         return super().create_runtime(spec)
 
+    def _launch_kwargs(
+        self,
+        spec: TuningSpec,
+        config: KernelConfig,
+    ) -> dict[str, Any]:
+        return {
+            **super()._launch_kwargs(spec, config),
+            "SCALES_ARE_QUANT": False,
+        }
+
+    def compile(self, spec: TuningSpec, config: KernelConfig) -> Any:
+        common = self._compile_common(spec)
+        args = (
+            *common[:4],
+            torch.float32,
+            torch.float32,
+            *common[4:],
+        )
+        return self.kernel.warmup(
+            *args,
+            grid=(1, 1),
+            **self._launch_kwargs(spec, config),
+        )
+
+    def make_launcher(
+        self,
+        spec: TuningSpec,
+        config: KernelConfig,
+        runtime: RuntimeTensors,
+    ) -> Callable[[], None]:
+        def run() -> None:
+            self.kernel[self._grid(spec, config)](
+                runtime.a,
+                runtime.b,
+                runtime.c,
+                runtime.bias_ptr,
+                runtime.scale_a,
+                runtime.scale_a,
+                spec.m,
+                spec.n,
+                spec.k,
+                *runtime.a.stride(),
+                *runtime.b.stride(),
+                *runtime.c.stride(),
+                *runtime.bias_strides,
+                **self._launch_kwargs(spec, config),
+            )
+
+        return run
+
 
 class PerChannelTmaAdapter(PerChannelAdapter):
     def __init__(

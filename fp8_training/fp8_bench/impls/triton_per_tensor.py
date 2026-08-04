@@ -259,28 +259,34 @@ def triton_per_tensor_bmm(
             if profile
             else batch_fp8_per_tensor_bmm_tma_kernel_autotuned
         )
+        scale_args = (dequant_scale, dequant_scale)
     else:
         kernel = (
             batch_fp8_per_tensor_bmm_kernel
             if profile
             else batch_fp8_per_tensor_bmm_kernel_autotuned
         )
+        scale_args = (dequant_scale,)
     launch_kwargs = {}
+    if use_tma:
+        launch_kwargs["SCALES_ARE_QUANT"] = False
     if profile:
-        launch_kwargs = {
-            "BLOCK_M": 64,
-            "BLOCK_N": 64,
-            "BLOCK_K": 128,
-            "GROUP_M": 8,
-            "num_warps": 4,
-            "num_stages": 3,
-        }
+        launch_kwargs.update(
+            {
+                "BLOCK_M": 64,
+                "BLOCK_N": 64,
+                "BLOCK_K": 128,
+                "GROUP_M": 8,
+                "num_warps": 4,
+                "num_stages": 3,
+            }
+        )
     kernel[grid](
         a_tensor,
         b_tensor,
         out,
         bias_ptr,
-        dequant_scale,
+        *scale_args,
         m,
         n,
         k,
